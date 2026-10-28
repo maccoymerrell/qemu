@@ -450,8 +450,65 @@ static x86_rmw_kind x86_locked_rmw_kind(const X86DecodedInsn *decode)
  * multi-byte no-op's emitter, and publishing an access for `nopl (%rax)`
  * would invent one.
  */
+/*
+ * THE VALUE AN IMMEDIATE OPERAND STATES IS THE ONE THE OPERATION USES.
+ *
+ * decode_op() reads every X86_TYPE_I field with insn_get_signed(), so
+ * op->imm holds the field sign-extended to target_long whatever the
+ * instruction does with it.  That is QEMU's convenience -- the emitters mask
+ * to the operation size when they use it -- and stated as held it published
+ * `mov $0xffffff9c,%edi` (bf 9c ff ff ff) with an operand of
+ * 0xffffffffffffff9c, a value the instruction never produces: a 32-bit MOV
+ * zero-extends into the 64-bit register.
+ *
+ * The architectural value is the field sign-extended TO THE OPERATION'S
+ * OPERAND SIZE where the instruction sign-extends it, and the field itself
+ * everywhere else:
+ *   - the integer arithmetic, logic, move and IMUL forms combine the
+ *     immediate with an integer operand of their operand size, so the value
+ *     is the field sign-extended to that size: `83 /0 ib` with a 32-bit
+ *     operand states 0xffffffff for -1 and with REX.W 0xffffffffffffffff,
+ *     `48 c7 c2 iz` states the 64-bit sign extension, and a form whose
+ *     field is already the operand size (`mov r32,imm32`, `mov al,ib`)
+ *     states the field;
+ *   - PUSH sign-extends to the stack-push size;
+ *   - every other X86_TYPE_I field is a count, an index, a selector or a
+ *     control byte (shift and rotate counts, BT's bit, ENTER, RET imm16,
+ *     AAM/AAD's base, every SSE/AVX imm8) that the instruction reads as
+ *     the unsigned field, so the value is the field at its own width.
+ * X86_TYPE_J is a branch displacement and keeps its sign extension, the
+ * address arithmetic it takes part in; X86_TYPE_I_unsigned is already the
+ * field.
+ */
+static uint64_t x86_df_imm_value(DisasContext *s, X86DecodedInsn *decode,
+                                 X86OpType type, MemOp field_ot, uint64_t imm)
+{
+    X86GenFunc gen = decode->e.gen;
+    MemOp width = field_ot;
+
+    if (type != X86_TYPE_I) {
+        return imm;
+    }
+    if (gen == gen_ADD || gen == gen_ADC || gen == gen_SUB ||
+        gen == gen_SBB || gen == gen_AND || gen == gen_OR ||
+        gen == gen_XOR || gen == gen_MOV || gen == gen_IMUL3) {
+        for (int j = 0; j < 3; j++) {
+            if (decode->op[j].unit == X86_OP_INT) {
+                width = decode->op[j].ot;
+                break;
+            }
+        }
+    } else if (gen == gen_PUSH) {
+        width = mo_pushpop(s, s->dflag);
+    }
+    return width >= MO_64 ? imm : imm & MAKE_64BIT_MASK(0, 8 << width);
+}
+
 static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
 {
+    const X86OpType types[3] = {
+        decode->e.op0, decode->e.op1, decode->e.op2
+    };
     bool has_ea = decode->op[0].has_ea || decode->op[1].has_ea ||
                   decode->op[2].has_ea;
     const char *word = decode->e.word;
@@ -462,13 +519,20 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
 
     for (int i = 0; i < 3; i++) {
         if (decode->op[i].unit == X86_OP_IMM) {
-            insn_dataflow_note_immediate(decode->op[i].imm,
-                                         INSN_DF_IMM_OPERAND);
+            insn_dataflow_note_immediate(
+                x86_df_imm_value(s, decode, types[i], decode->op[i].ot,
+                                 decode->op[i].imm),
+                INSN_DF_IMM_OPERAND);
         }
     }
     if (decode->e.op3 == X86_TYPE_I) {
-        /* The fourth operand's immediate has no X86DecodedOp of its own. */
-        insn_dataflow_note_immediate(decode->immediate, INSN_DF_IMM_OPERAND);
+        /*
+         * The fourth operand's immediate has no X86DecodedOp of its own; the
+         * table requires it to be I,b (decode-new.h).
+         */
+        insn_dataflow_note_immediate(
+            x86_df_imm_value(s, decode, X86_TYPE_I, MO_8, decode->immediate),
+            INSN_DF_IMM_OPERAND);
     }
     if (has_ea && decode->mem.disp != 0) {
         insn_dataflow_note_immediate((uint64_t)decode->mem.disp,

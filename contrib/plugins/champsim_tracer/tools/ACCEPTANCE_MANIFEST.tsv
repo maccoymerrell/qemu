@@ -1,0 +1,31 @@
+# ACCEPTANCE_MANIFEST.tsv — the standing legs of the rebuild program.
+# MAINTAINER RULING 2026-10-15: "We had a whole system in place to ensure no
+# drift, and to ensure the trace contents were matching external sources.
+# Dropping those should never have been an option. No justification for
+# doing so should have been sufficient."
+#
+# RULES OF THIS FILE:
+#  - Rows are added or removed ONLY by the maintainer. The orchestrator and
+#    agents may never skip, waive, or adjudicate a row away — not under an
+#    overnight grant, not for any reason. A wave that cannot run a row
+#    STOPS and reports; it does not proceed without it.
+#  - acceptance_gate.sh FAILS CLOSED: a row with no artifact, a stale
+#    artifact (tip-sha stamp mismatch), or an artifact without its PASS
+#    line is a FAIL. Absence is failure, never a pass.
+#  - Every oracle/comparator a row relies on must have a fresh FIRING
+#    PROOF (planted red) recorded in its artifact — a checker that cannot
+#    fire proves nothing (references-always-enforced doctrine).
+#
+# Columns: leg_id <TAB> artifact_glob (under results dir) <TAB> required_line_regex <TAB> description
+WIRE-PARITY	parity/*.txt	^PARITY: 0 unexplained	Old-vs-rebuild wire comparison, same cells+seeds, both arms; every delta attributed to a maintainer-adjudicated bug in the original; stamped with BOTH tree tips. The original's output is the format spec, incl. template minting (feedback_wire_parity_is_spec).
+R13-EXTERNAL	r13/*.txt	^R13: PASS	External-truth legs at the tip: referee (cst_referee) UNEXPLAINED=0 x4 ISAs + the applicable depmap/fdcheck/PIN legs, each with its firing proof (feedback_external_truth_standing_gate, feedback_references_always_enforced).
+DETERMINISM	det/*.txt	^DET: IDENTICAL	Per-cell r1-vs-r2 byte identity on decompressed segments, both arms, every matrix cell; a run with rc!=0 or a missing segment is NO-SUBJECT = FAIL.
+GOLDEN	golden/*.txt	^GOLDEN: PASS	Golden-trace net at the tip (fixed golden .cst, never re-traced), or the maintainer-approved re-baseline record for an adjudicated wire change.
+BOUNDARY	gates/boundary*.txt	fail=0	boundary_gate.sh: allowlist + engine line ratchet + boundary grep, fail=0, stamped at tip.
+SIMILARITY	gates/simgate*.txt	^SIMGATE: PASS	plugin_similarity_gate vs the frozen reference, with its planted-red proof.
+BUDGET	gates/budget*.txt	^BUDGET: ADJUDICATED	PLUGIN_BUDGET / RATCHET_BASELINE deltas enumerated and adjudicated (maintainer sign-off recorded for any raise).
+RATE	rate/*.txt	^RATE: PASS	The ruled rate bar (20M insns in a few minutes or less; run and close reported separately) vs the ORIGINAL tracer's measured rate on the same cells (feedback_tracing_rate_bar; no cross-wave comparison — interleaved arms).
+CONSUMER-COST	cost/*.txt	^COST: IN-FAMILY	Consumer-facing costs vs the original on the same cells: trace bytes, header/template count+bytes, decoder peak RSS, spill volume, close wall. Out-of-family (vs the original or vs sibling cells) = FAIL pending maintainer adjudication.
+SCREEN	screen/*.txt	^SCREEN: CLEAN	private-paper name screen over the full unpushed range (the pattern list lives outside the tree), zero matches
+TRAILERS	trailers/*.txt	^TRAILERS: CONFORM	Every commit in the push range carries the mandated trailer form; tree-identity proof recorded for any rewrite.
+FEATURE-PARITY	features/*.txt	^FEATURES: 0 ABSENT	The feature-parity inventory (feature_parity/FEATURE_PARITY.md) reads zero ABSENT and zero unadjudicated PRESENT-DIVERGENT rows against the original's full surface — options, modes, env tunables, counters, documented behaviors (maintainer ruling 2026-10-16: "No features should have been dropped"; row added under that ruling — strictness additions implement rulings, removals remain maintainer-only).

@@ -269,6 +269,11 @@ def _parse_args() -> argparse.Namespace:
                     required=True,
                     help="May be given multiple times.")
     al.add_argument("--build-dir", type=Path, required=True)
+    al.add_argument("--cst-decode", type=Path, default=None,
+                    help="cst_decode that scores this run's traces.  "
+                         "Outranks CST_DECODE, and unlike it never reaches "
+                         "the guest environment (whose length moves the "
+                         "guest stack base and every stack address).")
     al.add_argument("--diamonds", type=int, default=8)
     al.add_argument("--side-len-min", type=int, default=2)
     al.add_argument("--side-len-max", type=int, default=4)
@@ -1301,6 +1306,10 @@ def cmd_validate(args, isa: str | None = None) -> int:
 # The line is the contract; VERDICT_STAGE names where the ISA stopped so the
 # reader does not have to re-derive it from the log.
 ALL_VERDICT_PREFIX = "[all] isa="
+# The decoder that scores the run, printed once before the first ISA, so a
+# consumer (golden_net.py) can refuse a run scored by a decoder other than
+# the build-under-test's.
+ALL_DECODER_PREFIX = "[all] decoder="
 
 
 def _all_one_isa(args, isa: str, traced_bases: list) -> tuple:
@@ -1343,6 +1352,16 @@ def _all_one_isa(args, isa: str, traced_bases: list) -> tuple:
 def cmd_all(args) -> int:
     rc_total = 0
     skipped = False
+    # Name the decoder that will score every trace of this run, before any
+    # of them is produced: a run scored by a different build's decoder than
+    # the one under test reads as that build's verdict and is not.
+    from . import _cst_decode_runner as _CDR
+    if getattr(args, "cst_decode", None) is not None:
+        _CDR.set_cst_decode(args.cst_decode)
+    try:
+        print(f"{ALL_DECODER_PREFIX}{_CDR._find_cst_decode()}", flush=True)
+    except FileNotFoundError as e:
+        print(f"{ALL_DECODER_PREFIX}NONE ({e})", flush=True)
     # Every trace base this run produced, for the "(must be 0)" census below.
     # Collected even for an ISA whose validate failed: a broken cell's
     # invariants are exactly the ones worth reading.

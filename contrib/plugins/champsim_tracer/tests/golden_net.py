@@ -186,6 +186,8 @@ _VERDICT_RE = re.compile(r"^\[all\] isa=(\S+) rc=(-?\d+) stage=(\S+)\s*$",
 # Sentinel rc for "the validator produced no verdict for this ISA".  Distinct
 # from every rc the validator itself returns (0, 1, 77) so a manifest baseline
 # can never equal it and launder the absence into a pass.
+# The validator's "[all] decoder=<path>" line (ALL_DECODER_PREFIX).
+_DECODER_RE = re.compile(r"^\[all\] decoder=(\S.*?)\s*$", re.M)
 RC_NO_VERDICT = 254
 
 
@@ -205,9 +207,22 @@ def run_all(build: Path, wl: dict, out_dir: Path) -> dict:
     # REGFILE REG_SP it sets) is reproducible across shell sessions too --
     # setarch -R alone does not fix that.  sys.executable is absolute, so the
     # pipeline still finds python regardless of the pinned PATH.
+    # THE SCORING DECODER IS THE BUILD UNDER TEST'S.  This net hashes with
+    # cst_decode_bin(build), but the validator it spawns used to find its
+    # decoder on its own: PINNED_ENV carries no CST_DECODE, so a non-
+    # canonical build was hashed with its own decoder and SCORED with the
+    # canonical tree's.  The decoder is passed on the validator's command
+    # line (`all --cst-decode`), NOT added to PINNED_ENV: the qemu-user
+    # child inherits that environment onto the guest stack, and a
+    # CST_DECODE=<build path> entry moves the initial REG_SP by an amount
+    # that depends on where the build lives -- measured, it changes a
+    # cell's body hash with nothing else changed, which would make every
+    # non-canonical build hash-red against the reference.
+    decoder = cst_decode_bin(build).resolve()
     cmd = ["setarch", "-R",
            sys.executable, "-m", "champsim_tracer_validator", "all",
            "--seed", wl["seed"], "--build-dir", str(build.resolve()),
+           "--cst-decode", str(decoder),
            "--out-dir", str(out_dir.resolve()), "--compress", "none"]
     for isa in wl["isas"]:
         cmd += ["--isa", isa]
@@ -218,6 +233,16 @@ def run_all(build: Path, wl: dict, out_dir: Path) -> dict:
     seen = {isa: int(rc) for isa, rc, _stage in
             _VERDICT_RE.findall(proc.stdout or "")}
     per_isa = {isa: seen.get(isa, RC_NO_VERDICT) for isa in wl["isas"]}
+    # The validator names its scoring decoder; a run scored by any other is
+    # not this build's verdict, so every ISA of it is NO VERDICT.
+    used = _DECODER_RE.findall(proc.stdout or "")
+    print(f"  [{wl['name']}] validator scoring decoder: "
+          f"{used[0] if used else 'NOT REPORTED'} (build under test: "
+          f"{decoder})")
+    if used != [str(decoder)]:
+        print(f"  [{wl['name']}] REFUSED: the validator did not score with "
+              f"the build under test's decoder")
+        per_isa = {isa: RC_NO_VERDICT for isa in wl["isas"]}
     # The captured output used to be discarded outright, so a red cell said
     # only "validator rc=1" with the diagnosis thrown away.  Print it once,
     # for any run that is not clean on every requested ISA.

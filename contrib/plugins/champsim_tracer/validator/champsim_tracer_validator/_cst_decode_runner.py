@@ -134,7 +134,30 @@ class DynParam:
 # Locating cst_decode.
 # ---------------------------------------------------------------------------
 
+# A decoder named on the validator's COMMAND LINE (`all --cst-decode`).  It
+# outranks CST_DECODE because it is the one channel that does not reach the
+# guest: the qemu-user child inherits this process's environment, the guest
+# stack holds that environment, and its length sets the initial SP -- so a
+# CST_DECODE=<build path> variable moves REG_SP and every stack address in
+# the trace by an amount that depends on where the build lives (measured:
+# one golden-net cell's body hash changes with nothing else changed).
+# golden_net.py passes the build-under-test's decoder this way.
+_DECODER_OVERRIDE: Path | None = None
+
+
+def set_cst_decode(path) -> Path:
+    """Pin the decoder for this process; the path must exist."""
+    global _DECODER_OVERRIDE
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"--cst-decode {str(path)!r} does not exist")
+    _DECODER_OVERRIDE = p.resolve()
+    return _DECODER_OVERRIDE
+
+
 def _find_cst_decode() -> Path:
+    if _DECODER_OVERRIDE is not None:
+        return _DECODER_OVERRIDE
     explicit = os.environ.get("CST_DECODE")
     if explicit:
         p = Path(explicit)

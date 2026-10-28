@@ -563,13 +563,27 @@ static void x86_df_note_decoder_facts(DisasContext *s, X86DecodedInsn *decode)
 
         if (a->base == -2) {
             /*
-             * RIP-relative.  Without CF_PCREL the translator would have
-             * folded the program counter into a constant, and here it does
-             * not even do that much -- no address is computed at all -- so
-             * the register is named from the encoding.
+             * RIP-relative.  No address is computed here at all, so the
+             * register is named from the encoding -- as an input whose
+             * value is ALREADY IN a->disp.  gen_lea_modrm_0 added the next
+             * instruction's address (s->pc + s->rip_offset) to the encoded
+             * displacement when it parsed the modrm, so a->disp is the
+             * absolute address and the program counter contributes nothing
+             * further to the value: it is a source of the instruction and a
+             * member of the address's provenance, never a term to add
+             * (INSN_DF_EA_EXT_FOLDED).  Stated as a plain term it was added
+             * on top of the fold, and what a consumer reads for it at
+             * execution is the CPU's eip, which without CF_PCREL is the
+             * block's start: `prefetcht0 buf(%rip)' at 0x401011 published
+             * 0x803000 = 0x401000 + 0x402000 for an access at 0x402000.
+             *
+             * The fold is the translating mapping's address under CF_PCREL
+             * too, and that regime is withheld whenever a plugin is loaded
+             * (tcg_cflags_set_pcrel), so the one reader of these rows never
+             * sees a CF_PCREL translation.
              */
             parts[n++] = insn_df_ea(insn_df_reg(X86_DF_PC_NAME), 0,
-                                    INSN_DF_EA_EXT_NONE);
+                                    INSN_DF_EA_EXT_FOLDED);
         } else if (a->base >= 0 && a->base < CPU_NB_REGS) {
             parts[n++] = insn_df_ea(insn_df_reg(x86_reg_names[a->base]), 0,
                                     INSN_DF_EA_EXT_NONE);

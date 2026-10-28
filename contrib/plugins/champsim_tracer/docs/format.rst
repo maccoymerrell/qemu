@@ -2339,6 +2339,11 @@ time and computing ``ea = base + index_term + disp``, where
 ``index_term`` is ``index << shift_amount`` for an addressing form that
 shifts the index (the AArch64 register form) or ``index * scale`` for
 one that scales it (the x86 SIB form) — the two are mutually exclusive.
+An x86 RIP-relative operand (``prefetcht0 buf(%rip)``) has no register
+term: the translator folds the next instruction's address into the
+displacement, so ``disp`` is the absolute address, while ``REG_IP``
+stays a source of the instruction and a member of the address's
+dependency set.
 The synthesized
 EA appears in the same ``LOAD_ADDR[0]`` slot as a regular load and
 contributes to ``N_LOADS``. Opcode classification (PREFETCH / CACHE_FLUSH /

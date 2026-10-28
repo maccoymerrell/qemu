@@ -522,6 +522,22 @@ typedef struct InsnDataflowHelperAccess {
  * the transform is named; @shift is the operand size's log2.
  */
 #define INSN_DF_EA_EXT_BITOFF 3
+/*
+ * An input of the address whose VALUE the displacement already carries.
+ *
+ * x86's RIP-relative form without CF_PCREL: the translator folds the next
+ * instruction's address into the displacement at translation time
+ * (gen_lea_modrm_0), so the address is that constant and the program counter
+ * is an input of it that contributes nothing further.  The part is a source
+ * of the instruction and a member of the address's provenance, exactly as an
+ * ordinary component is, and it is NOT a term of the synthetic row: a
+ * consumer recomputing the address from the row's components adds the
+ * displacement alone.  Stated as a term it was added twice -- once folded,
+ * once read -- and the read is the CPU's stale eip, so `prefetcht0
+ * buf(%rip)' at 0x401011 named 0x803000 (TB start 0x401000 + the folded
+ * 0x402000) for an access at 0x402000.
+ */
+#define INSN_DF_EA_EXT_FOLDED 4
 
 /*
  * A synthetic address, as the components it is computed from.

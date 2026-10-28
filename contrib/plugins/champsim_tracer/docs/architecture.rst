@@ -2677,7 +2677,12 @@ addressed TLB invalidations (``invlpg*``, ``tlbi``, ``sfence.vma``,
 plugin's mem-callback never fires for them.  ``decode_synthetic_ea``
 captures the operand at translation time, and a per-insn exec
 callback reads the base / index registers at exec time to compute
-``ea = base + (index << shift_amount) * scale + disp``.  The result
+``ea = base + (index << shift_amount) * scale + disp``.  An x86
+RIP-relative operand is stated with the program counter as a *folded*
+input (``INSN_DF_EA_EXT_FOLDED``): the translator has already added the
+next instruction's address into ``disp``, so the PC is a source and an
+address dependency but no term the callback adds — reading it at exec
+time would add the block's stale ``eip`` on top of the fold.  The result
 is funneled through ``MemAccessRecorder::record_synthetic_load`` so
 it shows up in the ``LOAD_ADDR[0]`` slot the same way a normal load
 would.  This relies on the ``scale`` (x86 SIB) and

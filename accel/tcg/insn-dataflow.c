@@ -1927,6 +1927,7 @@ static int df_note_synth_ea(unsigned dir, uint32_t size,
     InsnDataflowSynthEa row = { 0 };
     InsnDataflow *d;
     bool whole = true;
+    unsigned np = 0;
     int k;
 
     if (df == NULL || !df->decoding) {
@@ -1949,17 +1950,31 @@ static int df_note_synth_ea(unsigned dir, uint32_t size,
         df_state(parts[i].atom, INSN_DF_RD);
 
         /*
+         * A folded input is provenance and a read, and no term of the value:
+         * the displacement already holds what it contributed
+         * (INSN_DF_EA_EXT_FOLDED).  Its bit is in addr_prov above; a row
+         * that also listed it would add it twice.
+         */
+        if (parts[i].ext == INSN_DF_EA_EXT_FOLDED) {
+            if (bit < 0) {
+                whole = false;
+            }
+            continue;
+        }
+
+        /*
          * The components, for the consumer that recomputes the address.  An
          * address short one of its terms is a DIFFERENT address and not an
          * approximate one, so a component that resolved to no bit, or one
          * more component than a row holds, voids the whole row rather than
          * shortening it.
          */
-        if (i < INSN_DF_MAX_EA_PARTS && bit >= 0) {
-            row.part_bit[i] = (uint8_t)bit;
-            row.part_shift[i] = parts[i].shift;
-            row.part_ext[i] = parts[i].ext;
-            row.n_parts = (uint8_t)(i + 1);
+        if (np < INSN_DF_MAX_EA_PARTS && bit >= 0) {
+            row.part_bit[np] = (uint8_t)bit;
+            row.part_shift[np] = parts[i].shift;
+            row.part_ext[np] = parts[i].ext;
+            np++;
+            row.n_parts = (uint8_t)np;
         } else {
             whole = false;
         }

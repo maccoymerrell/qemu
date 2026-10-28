@@ -1013,30 +1013,22 @@ struct Stats {
      *   its own PC (the same single-iteration translation jumps back before
      *   taking the zero-count exit); the emitted terminal edge was restored
      *   to the architectural fall-through.
-     * rep_reg_writes_deferred — iterations that published NO
-     *   destination register write, i.e. (iterations - 1) per repeating
-     *   instruction (#174).  NOT a fan-out counter, despite where the
-     *   larger share of it is counted: a single-iteration translation
-     *   (-icount, single-step, TF, an interrupt shadow) never takes the
-     *   fan-out path, yet each of its continuation passes defers a write
-     *   just the same, so this reads the SAME total in both regimes while
-     *   rep_fanout reads that total and zero.  Naming it for the fan-out
-     *   would attribute the deferral to a mechanism that did not run —
-     *   the mistake #173 records on the surplus term.  A repeating
-     *   instruction updates its
-     *   architectural registers ONCE, on completion; the fan-out renders
-     *   one entry per iteration only so the per-iteration memops have
-     *   somewhere to attach, and iteration N carries the whole
-     *   instruction's observed result.  This counts the entries that
-     *   correctly carry none — publishing intermediate values would inject
-     *   rename pressure and an N-long serial dependency chain that no real
-     *   machine has. */
+     * rep_iter_reg_writes_captured — fanned-out iterations 1..N-1 whose
+     *   destination writes were published from the capture taken at the
+     *   next iteration's first access (vcpu_self_loop_regs_cb); every
+     *   iteration publishes its own writes (maintainer ruling 2026-10-28,
+     *   which retired #174's last-iteration-only contract).
+     * rep_iter_reg_writes_absent — such iterations with no usable capture
+     *   (regdata capture muted, a wider-than-64-bit destination, a dropped
+     *   memop), published with absent (width 0) slots rather than a
+     *   guessed value.  Expected 0. */
     uint64_t rep_iters_architectural = 0;
     uint64_t rep_iters_inferred = 0;
     uint64_t rep_iters_memop_mismatch = 0;
     uint64_t rep_trailing_pass_dropped = 0;
     uint64_t rep_exit_edge_recovered = 0;
-    uint64_t rep_reg_writes_deferred = 0;
+    uint64_t rep_iter_reg_writes_captured = 0;
+    uint64_t rep_iter_reg_writes_absent = 0;
     /* wp_self_loop_fanout_iters — wrong-path iterations 2..N of a
      *   self-looping instruction that retired several units inside ONE
      *   speculated exec_tb (an AArch64 FEAT_MOPS bulk op; an x86 REP is

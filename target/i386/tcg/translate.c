@@ -1727,6 +1727,18 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     gen_rep_plugin_complete(s, false);
     gen_rep_plugin_reenter(s, false);
     gen_rep_plugin_chunk_const(s, false);
+    /*
+     * And the instruction pointer of that state: between two iterations
+     * an interrupt sees EIP on the REP itself.  The looping translation
+     * otherwise leaves env->eip wherever the block last synced it (its
+     * entry), so a register read between iterations would name an
+     * instruction that is not executing.  Every path out of the REP
+     * writes EIP itself, so syncing it here changes nothing the guest
+     * can observe.
+     */
+    if (s->base.plugin_enabled && can_loop) {
+        gen_update_eip_cur(s);
+    }
 #endif
 
     /* Any iteration at all?  */
@@ -1742,6 +1754,30 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     if (s->aflag == MO_32) {
         tcg_gen_ext32u_tl(cx_next, cx_next);
         cx_mask = ~0;
+    }
+#endif
+
+#ifdef CONFIG_PLUGIN
+    /*
+     * THE STATE BETWEEN TWO ITERATIONS IS THE STATE AN INTERRUPT SEES.
+     *
+     * A REP is interruptible after any iteration but the last, and an
+     * interrupt taken there observes EFLAGS.RF set (the paths below that
+     * leave the loop to re-enter it set RF for exactly that reason).  The
+     * looping translation keeps RF out of env->eflags while it iterates,
+     * so a plugin reading the registers between two iterations of one
+     * execution -- the per-iteration register capture -- would see a state
+     * no interruption can produce, and a different one from the
+     * single-iteration translation, which re-enters with RF set after
+     * every iteration.  Under a plugin the repetition therefore carries RF
+     * from its first iteration, and @done clears it on completion: the
+     * architectural sequence of states, with no guest-visible difference
+     * (nothing reads EFLAGS mid-instruction except a delivery that sets RF
+     * itself).
+     */
+    bool plugin_rf = s->base.plugin_enabled && can_loop && !had_rf;
+    if (plugin_rf) {
+        gen_set_eflags(s, RF_MASK);
     }
 #endif
 
@@ -1832,6 +1868,11 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
     /* Every path into @done retires the instruction and advances past it. */
     gen_rep_plugin_complete(s, true);
     gen_rep_plugin_reenter(s, false);
+    if (plugin_rf) {
+        /* @done is also reached by the zero-count test, ahead of the set
+         * above: clearing a clear RF is harmless. */
+        gen_reset_eflags(s, RF_MASK);
+    }
 #endif
     if (had_rf) {
         gen_reset_eflags(s, RF_MASK);

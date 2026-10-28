@@ -938,12 +938,23 @@ illegal_return:
  * fault and must not be unwound as one.
  */
 #ifdef CONFIG_PLUGIN
+/*
+ * @prog (FEAT_MOPS only, MOPS_NO_PROG otherwise): how many bytes of this
+ * execution's transfer had been STORED before the emission's first byte.
+ * Each piece's plugin callback then sees the instruction's registers as
+ * an interruption at that point would leave them -- see
+ * mops_publish_progress().
+ */
+#define MOPS_NO_PROG UINT64_MAX
+static void mops_publish_progress(CPUARMState *env, uint64_t done);
+
 static void arm_plugin_emit_pieces(CPUARMState *env, uint64_t addr,
                                    uint64_t size, const void *host,
                                    int memidx, enum qemu_plugin_mem_rw rw,
-                                   bool count, uintptr_t ra)
+                                   bool count, uintptr_t ra, uint64_t prog)
 {
     CPUState *cs = env_cpu(env);
+    uint64_t emitted = 0;
 
     if (likely(!cs->neg.plugin_mem_cbs)) {
         return;
@@ -992,6 +1003,11 @@ static void arm_plugin_emit_pieces(CPUARMState *env, uint64_t addr,
             host = p + bytes;
         }
 
+        if (count && prog != MOPS_NO_PROG) {
+            /* A load moves nothing yet: the bytes count once stored. */
+            mops_publish_progress(env, rw == QEMU_PLUGIN_MEM_W
+                                       ? prog + emitted : prog);
+        }
         qemu_plugin_vcpu_mem_cb(cs, addr, low, high,
                                 make_memop_idx(MO_LE | sz, memidx), rw);
         if (count) {
@@ -999,6 +1015,7 @@ static void arm_plugin_emit_pieces(CPUARMState *env, uint64_t addr,
         }
         addr += bytes;
         size -= bytes;
+        emitted += bytes;
     }
 }
 
@@ -1034,12 +1051,39 @@ typedef struct MopsAccCtx {
     MopsRun w;                /* store side (SET / CPY destination) */
 } MopsAccCtx;
 
+/*
+ * THE REGISTERS OF AN INTERRUPTIBLE BULK OPERATION, PER ACCESS.
+ *
+ * A FEAT_MOPS instruction is architecturally interruptible at any byte:
+ * an exception taken part-way leaves Xd/Xs/Xn describing exactly the
+ * bytes already transferred, and the instruction resumes from there.  The
+ * step helpers keep env->xregs in that form at their own step boundaries
+ * (a page, or a byte on the fallbacks), but a plugin observes the
+ * transfer one reported access at a time -- the unit the tracer renders
+ * as one iteration of the instruction -- and between two step boundaries
+ * the registers would still name the step's start.  So each MOPS
+ * execution states, at entry, how its three registers move with the
+ * bytes stored (@base + @sign * done, @sign in {-1, 0, +1}), and the
+ * reporter rewrites them to that state before each access's callback.
+ * The value written is the one the helper itself would leave if the
+ * operation stopped there; the helper's own writes at its step
+ * boundaries and on completion supersede it, so the guest-visible
+ * semantics are unchanged.
+ */
+typedef struct MopsRegProgress {
+    bool     active;
+    uint8_t  reg[3];
+    int8_t   sign[3];
+    uint64_t base[3];
+} MopsRegProgress;
+
 typedef struct MopsReportAcc {
     MopsAccCtx cp;            /* correct path */
     MopsAccCtx spec;          /* wrong path (plugin_spec_mode) */
+    MopsRegProgress prog;     /* the executing MOPS instruction's registers */
 } MopsReportAcc;
 
-static MopsAccCtx *mops_acc_ctx(CPUARMState *env)
+static MopsReportAcc *mops_report_acc(CPUARMState *env)
 {
     CPUState *cs = env_cpu(env);
     MopsReportAcc *acc = cs->plugin_mops_report;
@@ -1048,30 +1092,62 @@ static MopsAccCtx *mops_acc_ctx(CPUARMState *env)
         acc = g_new0(MopsReportAcc, 1);
         cs->plugin_mops_report = acc;
     }
-    return cs->plugin_spec_mode ? &acc->spec : &acc->cp;
+    return acc;
+}
+
+static void mops_publish_progress(CPUARMState *env, uint64_t done)
+{
+    MopsReportAcc *acc = env_cpu(env)->plugin_mops_report;
+
+    if (!acc || !acc->prog.active) {
+        return;
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        if (acc->prog.sign[i] > 0) {
+            env->xregs[acc->prog.reg[i]] = acc->prog.base[i] + done;
+        } else if (acc->prog.sign[i] < 0) {
+            env->xregs[acc->prog.reg[i]] = acc->prog.base[i] - done;
+        }
+    }
+}
+
+static MopsAccCtx *mops_acc_ctx(CPUARMState *env)
+{
+    MopsReportAcc *acc = mops_report_acc(env);
+
+    return env_cpu(env)->plugin_spec_mode ? &acc->spec : &acc->cp;
 }
 
 /* Emit a run's accumulated range through the shared decomposition and
  * deactivate it.  MOPS runs always count toward plugin_rep_iters. */
+/* @uncounted: bytes at the end of the run whose step has not yet been
+ * added to plugin_rep_bytes (the fallback byte being appended, or a
+ * fast-path chunk completing the run), so the run's first byte sits at
+ * progress plugin_rep_bytes - (run length - uncounted). */
 static void mops_run_flush(CPUARMState *env, MopsRun *run,
-                           enum qemu_plugin_mem_rw rw)
+                           enum qemu_plugin_mem_rw rw, uint64_t uncounted)
 {
     if (run->active && run->hi > run->lo) {
+        uint64_t len = run->hi - run->lo;
+
         /* run->buf is this reporter's own heap buffer, so its bytes
          * cannot fault as a guest access: ra 0, no bracket. */
-        arm_plugin_emit_pieces(env, run->lo, run->hi - run->lo,
+        arm_plugin_emit_pieces(env, run->lo, len,
                                run->buf + (run->lo - run->buf_base),
-                               run->memidx, rw, true, 0);
+                               run->memidx, rw, true, 0,
+                               env_cpu(env)->plugin_rep_bytes -
+                               (len - uncounted));
     }
     run->active = false;
 }
 
 /* Chunk complete: emit both directions, load side first — the order the
- * fast path reports a copy chunk in. */
+ * fast path reports a copy chunk in.  Called on the chunk's last
+ * fallback byte, whose step is not yet counted. */
 static void mops_ctx_flush(CPUARMState *env, MopsAccCtx *ctx)
 {
-    mops_run_flush(env, &ctx->r, QEMU_PLUGIN_MEM_R);
-    mops_run_flush(env, &ctx->w, QEMU_PLUGIN_MEM_W);
+    mops_run_flush(env, &ctx->r, QEMU_PLUGIN_MEM_R, 1);
+    mops_run_flush(env, &ctx->w, QEMU_PLUGIN_MEM_W, 1);
 }
 
 /*
@@ -1220,13 +1296,14 @@ static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
                 }
                 /* The fast path reports a chunk whole, so this run now
                  * extends to the chunk boundary: flush it. */
-                mops_run_flush(env, run, rw);
+                mops_run_flush(env, run, rw, size);
                 return;
             }
             mops_run_drop_stale(run);
         }
     }
-    arm_plugin_emit_pieces(env, addr, size, host, memidx, rw, count, ra);
+    arm_plugin_emit_pieces(env, addr, size, host, memidx, rw, count, ra,
+                           count ? cs->plugin_rep_bytes : MOPS_NO_PROG);
 #else
     (void)env; (void)addr; (void)size; (void)host; (void)memidx; (void)rw;
     (void)count; (void)ra;
@@ -1263,11 +1340,46 @@ static void arm_plugin_bulk_mem_cb(CPUARMState *env, uint64_t addr,
 static inline void mops_plugin_entry(CPUARMState *env)
 {
     CPUState *cs = env_cpu(env);
+    MopsReportAcc *acc = cs->plugin_mops_report;
 
     cs->plugin_rep_iters = 0;
     cs->plugin_rep_bytes = 0;
     cs->plugin_rep_complete = false;
     cs->plugin_rep_reenter = false;
+    if (acc) {
+        acc->prog.active = false;
+    }
+}
+
+/*
+ * How this execution's registers move with the bytes it stores (see
+ * MopsRegProgress): register @rX = @bX + @sX * done, for the destination,
+ * source and size registers (@ss == 0: the register does not move, as for
+ * every SET's Xs).  Stated once per execution, right after
+ * mops_plugin_entry(), from the same values the helper itself computes
+ * its step-boundary writebacks from.
+ */
+static void mops_plugin_progress(CPUARMState *env,
+                                 int rd, int sd, uint64_t bd,
+                                 int rs, int ss, uint64_t bs,
+                                 int rn, int sn, uint64_t bn)
+{
+    MopsReportAcc *acc;
+
+    if (!env_cpu(env)->neg.plugin_mem_cbs) {
+        return;
+    }
+    acc = mops_report_acc(env);
+    acc->prog.reg[0] = rd;
+    acc->prog.sign[0] = sd;
+    acc->prog.base[0] = bd;
+    acc->prog.reg[1] = rs;
+    acc->prog.sign[1] = ss;
+    acc->prog.base[1] = bs;
+    acc->prog.reg[2] = rn;
+    acc->prog.sign[2] = sn;
+    acc->prog.base[2] = bn;
+    acc->prog.active = true;
 }
 
 static inline void mops_plugin_bytes(CPUARMState *env, uint64_t step)
@@ -1286,6 +1398,10 @@ static inline void mops_plugin_reenter(CPUARMState *env)
 }
 #else
 static inline void mops_plugin_entry(CPUARMState *env) {}
+static inline void mops_plugin_progress(CPUARMState *env,
+                                        int rd, int sd, uint64_t bd,
+                                        int rs, int ss, uint64_t bs,
+                                        int rn, int sn, uint64_t bn) {}
 static inline void mops_plugin_bytes(CPUARMState *env, uint64_t step) {}
 static inline void mops_plugin_complete(CPUARMState *env) {}
 static inline void mops_plugin_reenter(CPUARMState *env) {}
@@ -1354,7 +1470,8 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
             if (spec) {
                 env_cpu(env)->neg.plugin_mem_cbs = saved_cbs;
                 arm_plugin_emit_pieces(env, vaddr, blocklen, NULL, mmu_idx,
-                                       QEMU_PLUGIN_MEM_W, false, 0);
+                                       QEMU_PLUGIN_MEM_W, false, 0,
+                                       MOPS_NO_PROG);
             }
 #endif
             return;
@@ -1380,7 +1497,7 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
 #ifdef CONFIG_PLUGIN
         env_cpu(env)->neg.plugin_mem_cbs = saved_cbs;
         arm_plugin_emit_pieces(env, vaddr, blocklen, NULL, mmu_idx,
-                               QEMU_PLUGIN_MEM_W, false, 0);
+                               QEMU_PLUGIN_MEM_W, false, 0, MOPS_NO_PROG);
 #endif
         return;
     }
@@ -1781,6 +1898,8 @@ static void do_setp(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
     }
 
     mops_plugin_entry(env);
+    /* Xd = start + done, Xn = size - done: the writeback below, per byte. */
+    mops_plugin_progress(env, rd, 1, toaddr, rs, 0, 0, rn, -1, setsize);
     stagesetsize = MIN(setsize, page_limit(toaddr));
     while (stagesetsize) {
         env->xregs[rd] = toaddr;
@@ -1861,6 +1980,8 @@ static void do_setm(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
 
     /* Do the actual memset: we leave the last partial page to SETE */
     mops_plugin_entry(env);
+    /* Xn = -(remaining), counting up toward zero. */
+    mops_plugin_progress(env, rd, 0, 0, rs, 0, 0, rn, 1, -setsize);
     stagesetsize = setsize & TARGET_PAGE_MASK;
     while (stagesetsize > 0) {
         step = stepfn(env, toaddr, stagesetsize, data, memidx, &mtedesc, ra);
@@ -1937,6 +2058,7 @@ static void do_sete(CPUARMState *env, uint32_t syndrome, uint32_t mtedesc,
 
     /* Do the actual memset */
     mops_plugin_entry(env);
+    mops_plugin_progress(env, rd, 0, 0, rs, 0, 0, rn, 1, -setsize);
     while (setsize > 0) {
         step = stepfn(env, toaddr, setsize, data, memidx, &mtedesc, ra);
         mops_plugin_bytes(env, step);
@@ -2292,6 +2414,14 @@ static void do_cpyp(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
 
     mops_plugin_entry(env);
     if (forwards) {
+        /* Xd, Xs = start + done, Xn = size - done. */
+        mops_plugin_progress(env, rd, 1, toaddr, rs, 1, fromaddr,
+                             rn, -1, copysize);
+    } else {
+        /* A reverse prologue moves only the size. */
+        mops_plugin_progress(env, rd, 0, 0, rs, 0, 0, rn, -1, copysize);
+    }
+    if (forwards) {
         stagecopysize = MIN(copysize, page_limit(toaddr));
         stagecopysize = MIN(stagecopysize, page_limit(fromaddr));
         while (stagecopysize) {
@@ -2410,6 +2540,9 @@ static void do_cpym(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
 
     /* Do the actual memmove */
     mops_plugin_entry(env);
+    /* Xn = -(remaining) forwards, +remaining backwards; Xd/Xs stay. */
+    mops_plugin_progress(env, rd, 0, 0, rs, 0, 0, rn,
+                         forwards ? 1 : -1, forwards ? -copysize : copysize);
     if (forwards) {
         while (copysize >= TARGET_PAGE_SIZE) {
             step = copy_step(env, toaddr, fromaddr, copysize,
@@ -2512,6 +2645,9 @@ static void do_cpye(CPUARMState *env, uint32_t syndrome, uint32_t wdesc,
 
     /* Do the actual memmove */
     mops_plugin_entry(env);
+    /* Xn = -(remaining) forwards, +remaining backwards; Xd/Xs stay. */
+    mops_plugin_progress(env, rd, 0, 0, rs, 0, 0, rn,
+                         forwards ? 1 : -1, forwards ? -copysize : copysize);
     if (forwards) {
         while (copysize > 0) {
             step = copy_step(env, toaddr, fromaddr, copysize,

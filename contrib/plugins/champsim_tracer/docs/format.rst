@@ -2507,43 +2507,56 @@ visit:
 3. Both the parent BB template and the sub-template appear in the
    templates section; their ``template_id``\ s are independent and
    delta-encoded as usual in the body stream.
-4. **Destination registers ride the LAST iteration, and only it.**
-   Iterations 1..N-1 publish no destination-register write for the
-   fanned-out instruction; iteration N publishes the instruction's whole
-   architectural result.  Source registers are unaffected — every
-   iteration reads its pointers and counter, so all N entries carry
-   their sources.
+4. **Every iteration publishes its own destination-register writes.**
+   (Maintainer ruling, 2026-10-28: "Each iteration should be recorded.
+   A real processor treats REP (and MOPS from Arm) as interruptible, and
+   thus the register file will be changing per-iteration.")  An
+   interrupt between two iterations observes the counter and pointer
+   values the earlier iteration wrote, and the instruction resumes from
+   them, so those values are architectural state.  Iteration 1's writes
+   ride the entering block's entry, on the fan-out instruction's (tail)
+   slot; iterations 2..N's ride the entries of the single-instruction
+   self-loop block, one entry per iteration.  Source registers are
+   unaffected — every iteration reads its pointers and counter.
 
-   This is a property of the wire, not a capture limitation, and a
-   consumer must read it as one: the absence of a register write on
-   iterations 1..N-1 means *the instruction has not produced its result
-   yet*, not *the value was not captured*.  A repeating instruction
-   updates its architectural registers once, when it completes.  The
-   fan-out exists so that the memops — which genuinely differ per
-   iteration — have somewhere to attach; the registers do not differ per
-   iteration in any sense a consumer may observe.
+   The value an iteration publishes is the architectural state after
+   that iteration: the state observed at the next iteration's first
+   memory access, and for the last iteration the END state observed
+   after the instruction completed — identically for an x86 ``REP``
+   string operation and an AArch64 ``FEAT_MOPS`` instruction.
 
-   Publishing intermediate per-iteration values would misrepresent the
-   hardware in two ways that matter to anyone modelling a register file:
-   it would imply a rename allocation per iteration, which no machine
-   performs for a string or memory-copy instruction, and it would create
-   a serial dependency chain of length N through the counter and pointer
-   registers — turning a block copy that real hardware pipelines at many
-   bytes per cycle into N dependent steps.  Under this contract the N
-   entries are mutually independent: they all read the pre-completion
-   pointer and counter values, and one of them writes the result.
+   Every value is read from the guest, none derived.  Iteration N
+   carries the state observed after the instruction completed.
+   Iteration k < N carries the state observed at iteration k+1's first
+   memory access, which is where a looping translation exposes what
+   iteration k left: an x86 REP writes its counter and pointers back
+   every iteration, and for a FEAT_MOPS instruction — whose iteration is
+   one access — QEMU rewrites Xd / Xs / Xn to the state an interruption
+   before that access would leave.  A single-iteration translation
+   (``-icount``) reads each iteration live and publishes the same values
+   in the same places, so the register content does not depend on how
+   QEMU translated the instruction.  Under a plugin the looping x86
+   translation carries ``EFLAGS.RF`` through the repetition, as an
+   interrupt between two iterations observes it.  One case still
+   differs: the last iteration of a single-iteration translation (and so
+   of every wrong-path REP) is read before QEMU's trailing re-entry, and
+   publishes ``RF`` set and the REP's own address in ``REG_IP`` where the
+   looping translation publishes the completed state.  An iteration whose state could not
+   be read publishes its slots with no width — "no value captured" —
+   and is counted (``REP iteration register writes absent`` in the
+   stats log).
 
-   The value published on iteration N is the state the capture observed
-   after the instruction completed, published at the entry where it
-   becomes architecturally true.  It is not placed on iteration 1: that
-   would republish a later instant's state at an earlier one.
+   This replaces the earlier contract under which iterations 1..N-1
+   published no write and iteration N carried the whole result.  A
+   consumer that models a register file now sees N writes of the
+   counter and pointer registers, each one iteration's, with the serial
+   dependency they genuinely have: iteration k+1 reads what iteration k
+   wrote.
 
-   The rule is ISA-neutral and holds under every translation regime.
+   The rule is ISA-neutral and holds under every translation regime:
    x86 ``REP`` string operations and AArch64 ``FEAT_MOPS``
-   (``CPYF*``/``SET*``) fan out through the same path and obey it, and a
-   single-iteration translation (``-icount``), which *could* read each
-   iteration's registers live, publishes the same single write in the
-   same place.
+   (``CPYF*``/``CPY*``/``SET*``) fan out through the same path and obey
+   it, on the correct path and on the wrong path alike.
 
 What one iteration *is* differs by family, because only one of the two
 has an architectural iteration to count.
@@ -2676,8 +2689,9 @@ translation block with earlier instructions, that landing is read from
 the latched ``qemu_plugin_rep_*`` facts as "the REP ran", so the
 entering block carries iteration 1 and its memops exactly as on the
 correct path.  The register
-half of that invariance is the rule above: exactly one destination
-write, on the final iteration, whatever the translation.  A zero-count REP is a retired instruction and emits its
+half of that invariance is the rule above: every iteration publishes
+the state it left, read inside the loop or live, whatever the
+translation.  A zero-count REP is a retired instruction and emits its
 one entry, carrying no memops.
 
 A demand fault inside an iteration does not change the entry count

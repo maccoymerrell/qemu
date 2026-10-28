@@ -653,6 +653,7 @@ static WpStep wp_exec_one_tb(WpWalkState &st)
          */
         if (g_features.wp_reg_data) {
             wp_pending_reg_snaps.clear();
+            rep_state(g_wp_state.saved_cpu_index).wp_iter_regs.clear();
         }
         g_wp_state.last_executed_tb = nullptr;
         g_last_spec_refusal = SpecRefusal::FETCH;   /* refined by translation */
@@ -892,8 +893,9 @@ static void wp_attribute_memops(WpWalkState &st, BBTemplate *cur,
  * other instructions' memops plus the first unit, and each further unit
  * becomes a 1-insn block on the sub-template.  Iterations 1..N-1 loop back
  * to the instruction, the last one leaves on the block's own successor.
- * Registers follow the correct path's #174 contract: the instruction's
- * destination writes ride the LAST iteration only.  Each extra iteration is
+ * Registers follow the correct path's contract: every iteration publishes
+ * the destination state it left -- the capture taken at the next
+ * iteration's first access (RepIterRegFifo), the END state on the last.  Each extra iteration is
  * one simulated instruction of the excursion, exactly as each single-step
  * REP iteration is, so the fan stops at the wpdepth budget: iterations past
  * it are not published (their memops with them), and counted.
@@ -959,14 +961,28 @@ static void wp_fan_self_loop(WpWalkState &st, BBTemplate *bb_tmpl,
     RegSnap end_snaps[MAX_DST_REGS];
     bool regs = n_dst > 0 && n_dst <= MAX_DST_REGS &&
                 parent.reg_snaps.size() >= n_dst;
+    RepIterRegFifo &iter_q = rep_state(g_wp_state.saved_cpu_index).wp_iter_regs;
+    size_t iter_cursor = iter_q.head;
+    uint64_t rep_pc = bb_tmpl->insn_pcs[last];
+    /* The capture that closes iteration @k: taken at iteration k+1's
+     * first access. */
+    auto iter_snaps = [&](size_t k, RegSnap *out) {
+        size_t lo = std::min((k + 1) * mpi, rep_dps.size());
+        const DynParam *next = lo < rep_dps.size() ? &rep_dps[lo] : nullptr;
+        if (self_loop_iter_snaps(iter_q, iter_cursor, rep_pc, next, n_dst,
+                                 out)) {
+            g_stats.rep_iter_reg_writes_captured++;
+        } else {
+            g_stats.rep_iter_reg_writes_absent++;
+        }
+    };
     if (regs) {
         RegSnap *tail = parent.reg_snaps.data() +
                         (parent.reg_snaps.size() - n_dst);
         for (unsigned d = 0; d < n_dst; d++) {
             end_snaps[d] = tail[d];
-            cst_wide_zero(&tail[d].value);
-            tail[d].width_bytes = 0;
         }
+        iter_snaps(0, tail);
     }
 
     uint64_t exit_pc   = parent.branch_successor_pc;
@@ -1004,13 +1020,12 @@ static void wp_fan_self_loop(WpWalkState &st, BBTemplate *bb_tmpl,
         bool final_iter = (k == n_iter - 1);
         if (regs) {
             e.reg_snaps.assign(n_dst, RegSnap{});
-            for (unsigned d = 0; d < n_dst; d++) {
-                if (final_iter) {
+            if (final_iter) {
+                for (unsigned d = 0; d < n_dst; d++) {
                     e.reg_snaps[d] = end_snaps[d];
-                } else {
-                    cst_wide_zero(&e.reg_snaps[d].value);
-                    e.reg_snaps[d].width_bytes = 0;
                 }
+            } else {
+                iter_snaps(k, e.reg_snaps.data());
             }
         }
         e.branch_successor_pc    = final_iter ? exit_pc : loop_pc;

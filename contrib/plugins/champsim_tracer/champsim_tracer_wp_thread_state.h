@@ -15,6 +15,7 @@
 #define CHAMPSIM_TRACER_WP_THREAD_STATE_H
 
 #include <atomic>
+#include <cstddef>
 #include <vector>
 
 #include "champsim_tracer.h"
@@ -178,6 +179,146 @@ struct RepBoundaryHold {
 };
 
 /*
+ * PER-ITERATION DESTINATION CAPTURE OF A SELF-LOOPING INSTRUCTION
+ * (maintainer ruling 2026-10-28: "Each iteration should be recorded.  A
+ * real processor treats REP (and MOPS from Arm) as interruptible, and thus
+ * the register file will be changing per-iteration.").
+ *
+ * A looping translation runs every iteration of an x86 REP inside one
+ * execution, and a FEAT_MOPS step helper every access of its transfer, so
+ * the per-instruction snapshot taken at the successor sees only the END
+ * state.  The state between iterations is read where it exists: at the
+ * first memory access of each iteration, through a register-reading memory
+ * callback on the fan-out instruction alone.  The registers there are the
+ * instruction's state after the previous iteration -- x86's counter and
+ * pointers are written back per iteration, and the MOPS reporter rewrites
+ * Xd/Xs/Xn to the interrupt-point state before each access
+ * (mops_publish_progress, target/arm/tcg/helper-a64.c) -- so iteration k's
+ * destination values are the capture taken at iteration k+1's first
+ * access, and the final iteration's are the END state as before.
+ *
+ * Each capture is keyed by the access it was taken at (pc, address,
+ * direction), the same identity the emitted memop carries, so the fan-out
+ * pairs captures with iterations by matching keys in order rather than by
+ * position, and an access the emission does not render (a dropped or
+ * carried memop) cannot shift the pairing of the ones it does.  Values
+ * are the registers' low 64 bits and their read width: every destination a
+ * REP string operation or a MOPS instruction names is a GPR or the flags,
+ * and a capture holding a wider read is marked unusable rather than
+ * truncated.
+ */
+static constexpr unsigned REP_ITER_MAX_DST = 8;
+
+struct RepIterRegs {
+    uint64_t pc       = 0;
+    uint64_t vaddr    = 0;
+    bool     is_store = false;
+    bool     ok       = false;
+    uint8_t  n        = 0;
+    uint64_t val[REP_ITER_MAX_DST]   = {};
+    uint8_t  width[REP_ITER_MAX_DST] = {};
+};
+
+struct RepIterRegFifo {
+    /* Bound on captures held for emissions that never consume them; past
+     * it the oldest are dropped and counted. */
+    static constexpr size_t CAP = (size_t)1 << 22;
+    std::vector<RepIterRegs> q;
+    size_t   head = 0;
+    /* Accesses of the current execution since the last capture; FORCE
+     * makes the next access capture (a new execution begins an
+     * iteration). */
+    static constexpr uint32_t FORCE = UINT32_MAX;
+    uint32_t since = FORCE;
+    uint64_t dropped = 0;
+
+    void clear()
+    {
+        q.clear();
+        head = 0;
+        since = FORCE;
+    }
+    void push(const RepIterRegs &r)
+    {
+        if (q.size() - head >= CAP) {
+            head++;
+            dropped++;
+        }
+        q.push_back(r);
+        if (head > 4096 && head * 2 > q.size()) {
+            q.erase(q.begin(), q.begin() + (ptrdiff_t)head);
+            head = 0;
+        }
+    }
+    /* First capture at or after @from (an absolute index >= head) taken
+     * at the access (@pc, @vaddr, @is_store), looking at most @window
+     * captures ahead; SIZE_MAX if none.  Captures arrive in the order the
+     * accesses do, so the one an iteration needs is at the cursor or a
+     * few dropped accesses past it -- the window keeps a systematic miss
+     * from turning every lookup into a scan of the whole queue. */
+    size_t find(size_t from, uint64_t pc, uint64_t vaddr, bool is_store,
+                size_t window = SIZE_MAX) const
+    {
+        size_t i0 = from < head ? head : from;
+        size_t end = window < q.size() - i0 ? i0 + window : q.size();
+        for (size_t i = i0; i < end; i++) {
+            const RepIterRegs &r = q[i];
+            if (r.pc == pc && r.vaddr == vaddr && r.is_store == is_store) {
+                return i;
+            }
+        }
+        return SIZE_MAX;
+    }
+    /* Retire @pc's captures up to and including index @upto (SIZE_MAX:
+     * all of @pc's): the emission that consumed them is written.  Other
+     * instructions' captures keep their order. */
+    void release(uint64_t pc, size_t upto)
+    {
+        size_t w = head;
+        for (size_t i = head; i < q.size(); i++) {
+            bool drop = q[i].pc == pc && (upto == SIZE_MAX || i <= upto);
+            if (!drop) {
+                if (w != i) {
+                    q[w] = q[i];
+                }
+                w++;
+            }
+        }
+        q.resize(w);
+    }
+};
+
+/*
+ * The destination snapshots of one iteration from the capture taken at the
+ * NEXT iteration's first access @next (a memop of the rendered stream), or
+ * absent slots when there is none.  @cursor advances past the capture used,
+ * so the captures are consumed in stream order.  Returns whether a capture
+ * was found.
+ */
+inline bool self_loop_iter_snaps(RepIterRegFifo &q, size_t &cursor,
+                                 uint64_t pc, const DynParam *next,
+                                 unsigned n_dst, RegSnap *out)
+{
+    size_t at = next ? q.find(cursor, pc, next->value,
+                              next->type == DYN_STORE_ADDR, 64)
+                     : SIZE_MAX;
+    bool ok = at != SIZE_MAX && q.q[at].ok && q.q[at].n == n_dst;
+    for (unsigned d = 0; d < n_dst; d++) {
+        if (ok) {
+            out[d].value = cst_wide_from_u64(q.q[at].val[d]);
+            out[d].width_bytes = q.q[at].width[d];
+        } else {
+            cst_wide_zero(&out[d].value);
+            out[d].width_bytes = 0;
+        }
+    }
+    if (at != SIZE_MAX) {
+        cursor = at + 1;
+    }
+    return ok;
+}
+
+/*
  * Per-vCPU, and deliberately NOT thread-local.  The plugin's static TLS block
  * is a hard loader limit that the existing hot per-insn state already sits
  * against -- adding even one more thread_local object here makes dlopen fail
@@ -192,6 +333,10 @@ struct RepSelfLoopState {
     RepInFlight  cp_in_flight;
     RepArchFacts wp_facts;      /* wrong-path latch (independent walk) */
     RepInFlight  wp_in_flight;
+    /* Per-iteration destination captures (RepIterRegFifo), one queue per
+     * path: the wrong path's is cleared before every speculated exec_tb. */
+    RepIterRegFifo cp_iter_regs;
+    RepIterRegFifo wp_iter_regs;
 
     /*
      * Emission handoff: the facts for the entry emit_body_entry is being

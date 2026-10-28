@@ -342,10 +342,11 @@ class RepFanoutInvarianceTest(unittest.TestCase):
         (``:w=N``); a slot the instruction has not yet produced renders
         with no width at all, which is how the wire says "not yet".
 
-        The contract (format.rst, fan-out sub-template rule 4) is that a
-        self-looping instruction publishes its destination writes ONCE, on
-        the entry where it completes -- so the expected shape is zeros
-        followed by exactly one nonzero, at the end.
+        The contract (format.rst, fan-out sub-template rule 4; maintainer
+        ruling 2026-10-28) is that EVERY iteration publishes the
+        destination state it left -- a REP is interruptible, so the
+        register file changes per iteration -- so the expected shape is the
+        same nonzero count on every entry.
         """
         by_id = {t["template_id"]: t for t in templates}
 
@@ -365,6 +366,38 @@ class RepFanoutInvarianceTest(unittest.TestCase):
                 continue
             out.append(sum(
                 1 for r in (e.get("reg_snaps") or [])
+                if int(r.get("insn_index", -1)) == idx
+                and r.get("kind") == "dst"
+                and (r.get("width_bytes") or 0) > 0))
+        return out
+
+    @staticmethod
+    def _reg_values(templates, entries, rep_pc: int):
+        """The destination VALUES the REP at @rep_pc publishes, per entry.
+
+        One tuple per correct-path entry rendering the instruction: the
+        (value, width) of each destination slot that carries a write, in
+        slot order.  Compared across translation regimes: the looping
+        translation's per-iteration values come from a capture inside the
+        loop, the single-iteration translation's from a live read after
+        each execution, and both must be the guest's own state.
+        """
+        by_id = {t["template_id"]: t for t in templates}
+        out = []
+        for e in entries:
+            tmpl = by_id.get(e.get("template_id"))
+            if tmpl is None:
+                continue
+            idx = None
+            for i, ins in enumerate(tmpl.get("insns") or []):
+                if int(ins.get("pc", -1)) == rep_pc:
+                    idx = i
+                    break
+            if idx is None:
+                continue
+            out.append(tuple(
+                (r.get("value"), r.get("width_bytes"))
+                for r in (e.get("reg_snaps") or [])
                 if int(r.get("insn_index", -1)) == idx
                 and r.get("kind") == "dst"
                 and (r.get("width_bytes") or 0) > 0))
@@ -548,20 +581,35 @@ class RepFanoutInvarianceTest(unittest.TestCase):
                 for tag, w in (("can_loop=true", ctl_w),
                                ("can_loop=false", trg_w)):
                     self.assertTrue(
-                        all(x == 0 for x in w[:-1]),
-                        f"{label} ({tag}): an iteration before the last "
-                        f"published a destination register write: {w}.  "
-                        "The intermediate values of a self-looping "
-                        "instruction are not architectural results -- "
-                        "publishing them invents rename pressure and a "
-                        "serial dependency chain the hardware never has.")
-                    self.assertGreater(
-                        w[-1], 0,
-                        f"{label} ({tag}): the entry that COMPLETES this "
-                        f"REP published no destination register write: "
-                        f"{w}.  The instruction's architectural result "
-                        "reached no entry at all, so a consumer cannot "
-                        "see what it produced.")
+                        w and all(x == w[-1] and x > 0 for x in w),
+                        f"{label} ({tag}): not every iteration published "
+                        f"its destination register writes: {w}.  A REP is "
+                        "interruptible, so each iteration's counter and "
+                        "pointer writes are architectural state and ride "
+                        "that iteration's entry (maintainer ruling "
+                        "2026-10-28); a zero before the last entry is the "
+                        "retired last-iteration-only contract.")
+                # Values of iterations 1..N-1: the looping translation's
+                # come from the in-loop capture, the single-iteration
+                # translation's from its live read after each execution.
+                # The final iteration is not compared here: under the
+                # single-iteration translation the completing execution
+                # still re-enters (the trailing pass), so its live read
+                # carries EFLAGS.RF and the REP's own PC rather than the
+                # completed state -- a pre-existing regime artifact of the
+                # END capture, filed separately, not part of this contract.
+                ctl_v = self._reg_values(ctl_t, ctl_e, pc)[:-1]
+                trg_v = self._reg_values(trg_t, trg_e, pc)[:-1]
+                self.assertEqual(
+                    ctl_v, trg_v,
+                    f"{label}: the per-iteration destination VALUES this "
+                    f"REP publishes changed with how QEMU translated it.\n"
+                    f"  can_loop=true : {ctl_v}\n"
+                    f"  can_loop=false: {trg_v}\n"
+                    "The looping translation's values are captured inside "
+                    "the loop, the single-iteration translation's are read "
+                    "live after each execution; both are the guest's own "
+                    "state after that iteration and must agree.")
 
                 mpi = EXPECT_MPI[label]
                 for shape in ctl_cp:

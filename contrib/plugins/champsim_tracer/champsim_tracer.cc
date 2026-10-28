@@ -3399,6 +3399,78 @@ static void vcpu_insn_reg_snap_cb(unsigned int cpu_index, void *udata)
 }
 
 /*
+ * PER-ITERATION DESTINATION CAPTURE (see RepIterRegFifo).
+ *
+ * Armed on fan-out instructions only (x86 REP string operations, FEAT_MOPS
+ * bulk ops), and only when register data is recorded.  The execution
+ * callback marks the start of an execution, whose first access begins an
+ * iteration; the memory callback, registered with QEMU_PLUGIN_CB_R_REGS so
+ * the guest registers are synced, captures the instruction's destination
+ * registers at the first access of every iteration -- the state the
+ * previous iteration left -- and lets the remaining mpi-1 accesses of the
+ * iteration pass.
+ */
+static RepIterRegFifo &self_loop_fifo(unsigned int cpu_index)
+{
+    return g_wp_in_progress ? rep_state(cpu_index).wp_iter_regs
+                            : rep_state(cpu_index).cp_iter_regs;
+}
+
+static void vcpu_self_loop_exec_cb(unsigned int cpu_index, void *udata)
+{
+    (void)udata;
+    self_loop_fifo(cpu_index).since = RepIterRegFifo::FORCE;
+}
+
+static void vcpu_self_loop_regs_cb(unsigned int cpu_index,
+                                   qemu_plugin_meminfo_t info,
+                                   uint64_t vaddr, void *udata)
+{
+    if (!g_trace_segments.is_active_atomic() || g_capture_mute) {
+        return;
+    }
+    if (g_wp_in_progress ? !g_features.wp_reg_data : !g_features.reg_data) {
+        return;
+    }
+    const RegSnapInsnRef *ref = (const RegSnapInsnRef *)udata;
+    if (!ref || !ref->tb_tmpl ||
+        ref->insn_index >= ref->tb_tmpl->n_insns ||
+        !ref->tb_tmpl->insn_reg_names) {
+        return;
+    }
+    const InsnFields *f = &ref->tb_tmpl->insn_fields[ref->insn_index];
+    const InsnRegNames *names =
+        &ref->tb_tmpl->insn_reg_names[ref->insn_index];
+    unsigned mpi = f->rep_memops_per_iter;
+    if (mpi == 0) {
+        return;
+    }
+    RepIterRegFifo &q = self_loop_fifo(cpu_index);
+    if (q.since != RepIterRegFifo::FORCE && q.since < mpi) {
+        q.since++;
+        return;
+    }
+    q.since = 1;
+    RepIterRegs r;
+    r.pc = ref->tb_tmpl->insn_pcs[ref->insn_index];
+    r.vaddr = vaddr;
+    r.is_store = qemu_plugin_mem_is_store(info);
+    r.ok = f->n_dst_regs <= REP_ITER_MAX_DST;
+    r.n = (uint8_t)(r.ok ? f->n_dst_regs : 0);
+    for (unsigned d = 0; d < r.n; d++) {
+        RegSnap snap;
+        g_reg_snaps.read_into_snap(cpu_index, names->dst_qemu_reg_keys[d],
+                                   &snap);
+        if (snap.width_bytes > sizeof(uint64_t)) {
+            r.ok = false;
+        }
+        r.val[d] = snap.value.limb[0];
+        r.width[d] = snap.width_bytes;
+    }
+    q.push(r);
+}
+
+/*
  * The wrong path's capture of a delay-slot branch's destinations.
  * Registered — by wrong-path translations only — on the delay slot of a
  * [branch, delay-slot] tail, pointing at the branch: firing pre-exec of the
@@ -5265,17 +5337,16 @@ void emit_body_entry(BodyStreamState *out_stream,
      * (champsim_tracer_wp.cc), which applies this same split to the
      * units one speculated execution retired.
      *
-     * Register snapshots fan out per iteration like the memops (#138).
-     * A looping translation captures only the instruction's END state,
-     * which is the truth for the FINAL iteration and for no other; the
-     * x86 REP families' stepping discipline determines every
-     * intermediate state, and the wire does not publish one: a
-     * repeating instruction updates its architectural registers ONCE,
-     * on completion, so iterations 1..N-1 carry NO destination register
-     * write and iteration N carries the instruction's observed result
-     * (#174).  That is what keeps the wire clock-invariant — the
-     * single-iteration (-icount) translation, which could read each
-     * iteration live, publishes the same one write in the same place.
+     * Register snapshots fan out per iteration like the memops: each
+     * iteration publishes the destination state it left (maintainer
+     * ruling 2026-10-28 -- REP and MOPS are interruptible, so the
+     * register file changes per iteration).  A looping translation's
+     * successor snapshot is the END state, iteration N's; iterations
+     * 1..N-1 take theirs from the capture at the next iteration's first
+     * access (RepIterRegFifo).  The single-iteration (-icount)
+     * translation reads each iteration live and publishes the same
+     * values in the same places, which keeps the wire translation-
+     * invariant.
      */
     BBTemplate *rep_sub = bb_tmpl
         ? g_template_store.seg_deref(bb_tmpl->rep_subtmpl)
@@ -5656,74 +5727,72 @@ void emit_body_entry(BodyStreamState *out_stream,
                 };
 
                 /*
-                 * REGISTER CONTRACT FOR A FANNED-OUT SELF-LOOP (#174).
+                 * REGISTER CONTRACT FOR A FANNED-OUT SELF-LOOP: EVERY
+                 * ITERATION PUBLISHES ITS OWN DESTINATION WRITES.
                  *
-                 * The fan-out is a deliberate deviation: ONE architectural
-                 * instruction is rendered as N entries so that the memops,
-                 * which genuinely differ per iteration, have somewhere to
-                 * attach.  Its REGISTERS are not like its memops.  A
-                 * repeating instruction updates its architectural registers
-                 * ONCE, when it completes; the per-iteration values a
-                 * looping translation never materialises are not
-                 * architectural state a consumer may observe, and no real
-                 * machine renames a destination per iteration.
+                 * Maintainer ruling 2026-10-28: "Each iteration should be
+                 * recorded.  A real processor treats REP (and MOPS from Arm)
+                 * as interruptible, and thus the register file will be
+                 * changing per-iteration."  An interrupt between two
+                 * iterations observes the counter and pointers the earlier
+                 * iteration wrote, and the instruction resumes from them, so
+                 * each iteration's writes are architectural state and ride
+                 * that iteration's entry: iteration 1 on the entering
+                 * block's entry (the instruction is its terminator),
+                 * iterations 2..N on the entries of the 1-insn self-loop
+                 * sub-template.  (This replaces the #174 contract, which
+                 * published the writes on iteration N only.)
                  *
-                 * Publishing them would inject two fictions into every
-                 * consumer that models a register file: rename pressure
-                 * proportional to the iteration count, and a SERIAL
-                 * dependency chain of length N through RCX/RSI/RDI — turning
-                 * a block copy that hardware pipelines at many bytes per
-                 * cycle into N dependent steps.  So:
+                 * Every value is READ, none derived.  Iteration N's is the
+                 * END state the successor's pre-execution snapshot captured,
+                 * as before; iteration k < N's is the capture
+                 * vcpu_self_loop_regs_cb took at iteration k+1's first
+                 * access, which is where the state iteration k left is
+                 * observable inside a looping translation (RepIterRegFifo).
+                 * The single-iteration translation reads the same values
+                 * live, one execution per iteration, so the wire does not
+                 * depend on how QEMU translated the instruction.  A missing
+                 * capture leaves that iteration's slots absent (width 0)
+                 * and is counted, never guessed.
                  *
-                 *   iterations 1 .. N-1 publish NO destination register
-                 *   write; iteration N publishes the instruction's whole
-                 *   architectural result.
-                 *
-                 * The value placed on iteration N is the END state the
-                 * capture actually observed (sampled once, at the successor
-                 * instruction's pre-execution snapshot, after every
-                 * iteration has run).  It is published at the entry where it
-                 * was observed and where it becomes architecturally true —
-                 * putting it on iteration 1 would republish a later
-                 * instant's state at an earlier one, the defect shape of
-                 * #79.  Nothing is derived and nothing is invented: the one
-                 * published value is read, and the absent ones are absent
-                 * because the instruction did not produce them yet.
-                 *
-                 * Sources are untouched — every iteration reads its
-                 * pointers and counter, so all N entries keep their source
-                 * registers and stay independent of one another.
-                 *
-                 * ISA-neutral by construction: x86 REP and AArch64
-                 * FEAT_MOPS fan out through this same path and obey the
-                 * same contract, with no per-family law to write.
-                 *
-                 * IFRAME-safe: emit_iframe_if_due re-encodes the CP
-                 * register families from the PERSISTENT overlay, not from
-                 * the entry's snaps, so an entry that publishes no register
-                 * write re-encodes to the running state (the pre-completion
-                 * values) rather than to template defaults.
+                 * ISA-neutral: x86 REP and AArch64 FEAT_MOPS fan out through
+                 * this same path; for MOPS an iteration is one reported
+                 * access, and QEMU's reporter rewrites Xd/Xs/Xn to the
+                 * interrupt-point state before each access.
                  */
                 unsigned n_dst = lf->n_dst_regs;
                 RegSnap rep_end_snaps[MAX_DST_REGS];
                 bool rep_regs = (g_features.reg_data && n_dst > 0 &&
                                  n_dst <= MAX_DST_REGS &&
                                  entry.reg_snaps.size() >= n_dst);
+                RepIterRegFifo &iter_q = rs.cp_iter_regs;
+                size_t iter_cursor = iter_q.head;
+                uint64_t rep_pc = bb_tmpl->insn_pcs[last];
+                /* The capture that closes iteration @k: taken at the first
+                 * access of iteration k+1's slice. */
+                auto iter_snaps = [&](size_t k, RegSnap *out) {
+                    size_t lo, hi;
+                    rep_slice(k + 1, lo, hi);
+                    const DynParam *next = lo < hi ? &rep_dps[lo] : nullptr;
+                    if (self_loop_iter_snaps(iter_q, iter_cursor, rep_pc,
+                                             next, n_dst, out)) {
+                        g_stats.rep_iter_reg_writes_captured++;
+                    } else {
+                        g_stats.rep_iter_reg_writes_absent++;
+                    }
+                };
                 if (rep_regs) {
                     /* The REP is the parent BB's LAST instruction, so its
                      * destination slots are the tail of the parent's
                      * positional snap vector.  Lift the observed END state
-                     * out for iteration N, and leave the parent (iteration
-                     * 1) publishing no write for those slots. */
+                     * out for iteration N, and give the parent (iteration
+                     * 1) the state iteration 1 left. */
                     RegSnap *tail = entry.reg_snaps.data() +
                                     (entry.reg_snaps.size() - n_dst);
                     for (unsigned d = 0; d < n_dst; d++) {
                         rep_end_snaps[d] = tail[d];
-                        cst_wide_zero(&tail[d].value);
-                        tail[d].width_bytes = 0;
                     }
-                    g_stats.rep_reg_writes_deferred +=
-                        (uint64_t)(n_iter - 1);
+                    iter_snaps(0, tail);
                 }
                 /* Iter 1: parent BB template + non-REP memops + iteration
                  * 0's slice. */
@@ -5737,10 +5806,8 @@ void emit_body_entry(BodyStreamState *out_stream,
                 /* n_iter > 1 here, so iter 1 always loops. */
                 entry.branch_successor_pc    = rep_loop_pc;
                 entry.branch_successor_known = rep_exit_known;
-                /* The parent renders iteration 1, which publishes no
-                 * destination register write (#174): its REP slots were
-                 * cleared above and the instruction's result rides
-                 * iteration N. */
+                /* The parent renders iteration 1 and publishes the
+                 * destination state iteration 1 left (set above). */
                 if (out_stream) {
                     body_stream_write_entry(out_stream, &entry);
                 }
@@ -5841,25 +5908,15 @@ void emit_body_entry(BodyStreamState *out_stream,
                 sub_e.branch_successor_known = rep_exit_known;
                 sub_e.dyn_params.reserve(mpi);
                 /* Every sub-entry carries its own iteration's
-                 * destination snapshots (#138): the reconstruction laws
-                 * above, or the captured END state on the final
-                 * iteration.  That also keeps the dedup case (a 1-insn
-                 * REP BB is its own rep_subtmpl, sharing one persistent
-                 * (asid,thread) field-state block with the parent)
-                 * IFRAME-consistent: each entry stages its real values,
-                 * so a decode-side re-encode reproduces exactly what the
-                 * field state holds.
-                 *
-                 * When the reconstruction did not engage (regdata off,
-                 * no architectural count, degraded snap capture), the
-                 * dedup case keeps the legacy carry of the parent's
-                 * snaps — the shared block would otherwise hold the
-                 * parent's values while an IFRAME re-encode of an
-                 * empty-snap sub-entry reproduces template defaults,
-                 * tripping the decoder's IFRAME self-validation.
-                 * Positionally sound: a dedup parent is provably 1-insn,
-                 * so its reg_snaps are exactly insn 0's destination
-                 * slots, matching the 1-insn sub template. */
+                 * destination snapshots: the capture taken at the next
+                 * iteration's first access, or the captured END state on
+                 * the final iteration.  That also keeps the dedup case (a
+                 * 1-insn REP BB is its own rep_subtmpl, sharing one
+                 * persistent (asid,thread) field-state block with the
+                 * parent) IFRAME-consistent: each entry stages its real
+                 * values, so a decode-side re-encode reproduces exactly
+                 * what the field state holds.  Slots start absent and are
+                 * filled per iteration below. */
                 if (rep_regs) {
                     /* One slot per declared destination, all absent; the
                      * final iteration below fills them with the observed
@@ -5876,10 +5933,13 @@ void emit_body_entry(BodyStreamState *out_stream,
                     sub_e.seq_num = g_trace_segments.next_seq_num();
                     if (rep_regs && k == n_iter - 1) {
                         /* Iteration N: the instruction completes here, so
-                         * this entry carries the architectural result. */
+                         * this entry carries the END state it was observed
+                         * in. */
                         for (unsigned d = 0; d < n_dst; d++) {
                             sub_e.reg_snaps[d] = rep_end_snaps[d];
                         }
+                    } else if (rep_regs) {
+                        iter_snaps(k, sub_e.reg_snaps.data());
                     }
                     sub_e.dyn_params.clear();
                     size_t sk, ek;
@@ -5896,6 +5956,10 @@ void emit_body_entry(BodyStreamState *out_stream,
                     if (out_stream) {
                         body_stream_write_entry(out_stream, &sub_e);
                     }
+                }
+                /* The captures this emission consumed are spent. */
+                if (iter_cursor > iter_q.head) {
+                    iter_q.release(rep_pc, iter_cursor - 1);
                 }
                 return;
             }
@@ -5932,37 +5996,21 @@ void emit_body_entry(BodyStreamState *out_stream,
                 efacts.reenter && !rep_retired) {
                 g_stats.wire_user_rep_extra_insns += 1;
             }
-            /* THE SAME REGISTER CONTRACT, ENFORCED ON THE OTHER
-             * TRANSLATION REGIME (#174).  A single-iteration translation
-             * (-icount, singlestep, TF) delivers each iteration as its own
-             * execution, so this path COULD publish the live per-iteration
-             * registers it just read — and did, which made the wire's
-             * register content depend on how QEMU chose to translate.  An
-             * execution that re-enters the same repeating instruction is
-             * not its final iteration, so it publishes no destination
-             * write; the completing execution (the one that does not
-             * re-enter) carries the architectural result.  The rule is the
-             * same one the fan-out above applies, so both regimes render
-             * one write, in the same place.
-             *
-             * The discriminator is COMPLETION, not re-entry.  The last
-             * counted iteration also re-enters — into the trailing
-             * zero-count pass that contributes no entry — so gating on
-             * re-entry alone would suppress every iteration and the
-             * result would reach no entry at all.  efacts.complete marks
-             * the execution that retired the instruction, which is the
-             * last one that renders. */
-            if (efacts.reenter && !rep_retired && g_features.reg_data && lf &&
-                lf->n_dst_regs > 0 && !entry.reg_snaps.empty()) {
-                unsigned nd = lf->n_dst_regs;
-                if (entry.reg_snaps.size() >= nd) {
-                    RegSnap *tail = entry.reg_snaps.data() +
-                                    (entry.reg_snaps.size() - nd);
-                    for (unsigned d = 0; d < nd; d++) {
-                        cst_wide_zero(&tail[d].value);
-                        tail[d].width_bytes = 0;
-                    }
-                    g_stats.rep_reg_writes_deferred += 1;
+            /* THE SAME REGISTER CONTRACT ON THE OTHER TRANSLATION REGIME.
+             * A single-iteration translation (-icount, singlestep, TF, the
+             * interrupt shadow) delivers each iteration as its own
+             * execution, and the live snapshot it just read IS that
+             * iteration's destination state -- the value the fan-out above
+             * publishes for the same iteration from its capture.  It rides
+             * this entry unchanged.  This execution's own captures (one, at
+             * its first access) have no consumer here: retire them. */
+            if (!rep_dps.empty()) {
+                RepIterRegFifo &iq = rs.cp_iter_regs;
+                const DynParam &f0 = rep_dps.front();
+                size_t at = iq.find(iq.head, bb_tmpl->insn_pcs[last],
+                                    f0.value, f0.type == DYN_STORE_ADDR);
+                if (at != SIZE_MAX) {
+                    iq.release(bb_tmpl->insn_pcs[last], at);
                 }
             }
         }
@@ -9804,6 +9852,28 @@ static void arm_reg_snap_cbs(struct qemu_plugin_tb *tb, BBTemplate *new_tmpl,
             QEMU_PLUGIN_CB_R_REGS,
             QEMU_PLUGIN_COND_GE, g_scoreboard.is_active, 1,
             &refs[ci - 1]);
+    }
+    /* A fan-out instruction's own per-iteration capture (see
+     * vcpu_self_loop_regs_cb).  Skipped in the coarse fast-forward phase
+     * for the same reason the memop callback is. */
+    if (g_ff_coarse.load(std::memory_order_relaxed)) {
+        return;
+    }
+    for (size_t i = 0; i < raw_n_insns; i++) {
+        if (!canonical_first[i]) {
+            continue;
+        }
+        uint32_t ci = canonical_index[i];
+        const InsnFields *f = &new_tmpl->insn_fields[ci];
+        if (f->rep_memops_per_iter == 0 || f->n_dst_regs == 0) {
+            continue;
+        }
+        struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
+        qemu_plugin_register_vcpu_insn_exec_cb(
+            insn, vcpu_self_loop_exec_cb, QEMU_PLUGIN_CB_NO_REGS, nullptr);
+        qemu_plugin_register_vcpu_mem_cb(
+            insn, vcpu_self_loop_regs_cb, QEMU_PLUGIN_CB_R_REGS,
+            QEMU_PLUGIN_MEM_RW, &refs[ci]);
     }
 }
 

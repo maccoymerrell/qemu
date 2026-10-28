@@ -414,7 +414,12 @@ def built_artifacts(build: Path, system: bool) -> list[Path]:
     arts = [build / "contrib" / "plugins" / "libchampsim_tracer.so",
             cst_decode_bin(build), cst_visualize_bin(build)]
     if system:
+        # Every emulator the system net boots: the devio cells run
+        # qemu-system-x86_64 and the validator-run cells (SYSVAL_CELLS) the
+        # other three, so a stale aarch64/riscv64/mipsel binary must refuse
+        # the run like a stale x86 one.
         arts.append(sys_qemu_system_bin(build))
+        arts += [build / f"qemu-system-{c['isa']}" for c in SYSVAL_CELLS]
     else:
         arts += [build / f"qemu-{isa}" for isa in ALL_ISAS]
     return arts
@@ -999,16 +1004,114 @@ SYS_CELLS = [
                    "-smp", "2"]},
 ]
 
+# THE OTHER THREE ISAs, booted through the VALIDATOR's system mode rather
+# than the devio recipe above (978b1767e4, where these cells were captured
+# into manifest_system.json).  There is no devio kernel for aarch64, riscv64
+# or mipsel -- the devio cells exist to exercise virtio-blk O_DIRECT device
+# traffic on x86 -- but the validator already knows how to boot each ISA,
+# stage a marker workload and produce a trace, so these cells reuse that
+# instead of growing a second copy of per-ISA boot knowledge here.
+#
+# THE DETERMINISM IS MEASURED: 20 independent boots per ISA, six concurrent
+# so the host was loaded throughout.  riscv64 20/20 and mipsel 20/20 produced
+# a byte-identical CP-user slice on the REALTIME clock -- no icount forcing,
+# unlike the x86 int1/smp2 cells.  aarch64 was 19/20 and the outlier was the
+# PAN gate-loss defect (#180), fixed before the cell was captured.  Evidence:
+# cst_runs/p3/t170/{det,arm64b} and cst_runs/p3/t180.
+#
+# THESE CELLS WERE ONCE RECORDED AND NEVER RUN.  978b1767e4 lived on a line
+# champsim-trace did not keep; the manifest it captured (six canon cells)
+# came along and this table did not, so `check` traced the three devio
+# cells, skipped the other three with a bare `continue`, and printed
+# "GREEN: 1 decode + 6 canon cells" over a net that had verified three.
+# sys_check() now fails any recorded cell it has no definition for.
+SYSVAL_CELLS = [
+    {"name": "sysval_aarch64", "isa": "aarch64"},
+    {"name": "sysval_riscv64", "isa": "riscv64"},
+    {"name": "sysval_mipsel",  "isa": "mipsel"},
+]
+SYSVAL_SEED = "0x1701"
+SYSVAL_TIMEOUT = int(os.environ.get("CST_SYSVAL_TIMEOUT", "1800"))
+
+
+def sysval_trace_once(build: Path, isa: str, out_dir: Path,
+                      label: str) -> Path | None:
+    """Boot one validator system cell and return its .cst, or None.
+
+    Runs the validator's own `all --system` pipeline so the per-ISA boot
+    shape (machine, cpu model, console, kernel/rootfs staging) has exactly
+    one definition, in _system.py.  A non-zero exit is a FAILURE and is
+    reported as one -- the validator's content checks run inside this call,
+    so a red cell here means the trace is wrong, not that the golden moved.
+    The scoring decoder is the build under test's, passed as a flag and
+    never through the environment (see run_all).
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = ["setarch", "-R", sys.executable, "-m", "champsim_tracer_validator",
+           "all", "--isa", isa, "--seed", SYSVAL_SEED, "--system",
+           "--compress", "none", "--build-dir", str(build.resolve()),
+           "--cst-decode", str(cst_decode_bin(build).resolve()),
+           "--out-dir", str((out_dir / label).resolve())]
+    log = out_dir / f"{label}.run.log"
+    with open(log, "w") as f:
+        try:
+            rc = subprocess.call(cmd, cwd=VALIDATOR_DIR, env=PINNED_ENV,
+                                 stdout=f, stderr=subprocess.STDOUT,
+                                 timeout=SYSVAL_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            print(f"  sysval {label}: TIMEOUT after {SYSVAL_TIMEOUT}s")
+            return None
+    cst = out_dir / label / f"{label}_{isa}.cst"
+    if rc != 0 or not cst.is_file():
+        why = f"rc={rc}" if rc != 0 else f"rc=0 but {cst.name} MISSING"
+        print(f"  sysval {label}: FAIL {why} (see {log})")
+        return None
+    return cst
+
+
+def sysval_assets_missing(isa: str, build: Path) -> str | None:
+    """Why the validator system cell for @isa cannot run here, or None.
+
+    The caller FAILS on a reason: a recorded cell this host cannot boot is a
+    cell the net did not verify, and saying so is the whole point."""
+    try:
+        sys.path.insert(0, str(VALIDATOR_DIR))
+        from champsim_tracer_validator import _system as S  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        return f"validator _system module not importable ({e})"
+    boot = getattr(S, "_ISA_BOOT", {}).get(isa)
+    if not boot:
+        return f"validator has no boot shape for {isa}"
+    d = S.SYSTEST_ROOT / boot["dir"]
+    if not (d / boot["kernel"]).is_file():
+        return f"no {isa} kernel at {d / boot['kernel']}"
+    if not (d / "root").is_dir():
+        return f"no {isa} rootfs at {d / 'root'}"
+    qs = build / f"qemu-system-{isa}"
+    if not qs.is_file():
+        return f"{qs} not built"
+    return None
+
+
 # Frozen system fixtures for the DECODER guard (reuse the SVG fixture files).
 SYS_DECODE_FIXTURES = [
     {"name": "devio_sys_x86_64", "file": "devio_sys_x86_64.cst"},
 ]
 
 # --- CP-user-slice canonicalization ----------------------------------------
-# Kernel/user split: x86-64 user VAs sit below the non-canonical hole; kernel
-# and vsyscall live at/above it.  A user BB whose branch target is >= this is
-# a syscall/int into the (KASLR-shifted) kernel and must be masked.
-SYS_USER_MAX = 0x0000800000000000
+# Kernel/user split.  A user BB whose branch target is at or above it is a
+# syscall / trap into the (KASLR-shifted) kernel and must be masked.
+# Per-ISA, because the split is an architectural fact and not a constant.
+# x86-64 user space ends at the non-canonical hole; AArch64 user space is
+# TTBR0's 48-bit half with the kernel at 0xffff...; RISC-V sv39/sv48 user
+# addresses are likewise below the sign-extension boundary with the kernel
+# at 0xffff_ffc0_...; mipsel is 32-bit with kuseg below 0x80000000.
+SYS_USER_MAX_BY_ISA = {
+    "x86_64":  0x0000800000000000,
+    "aarch64": 0x0001000000000000,
+    "riscv64": 0x0001000000000000,
+    "mipsel":  0x80000000,
+}
 _BB_RE = re.compile(r'^(BB\d+)\s+(0x[0-9a-fA-F]+)\s+\(insns=(\d+)\s+'
                     r'fall_through=(0x[0-9a-fA-F]+)\)')
 _PROFILE_RE = re.compile(r'^\s*profile:\s+exec_cp=(\d+)\s+exec_wp=(\d+)')
@@ -1016,14 +1119,16 @@ _TARGET_RE = re.compile(r'^\s*target\[\d+\]:\s*pc=(0x[0-9a-fA-F]+)')
 _INSN_RE = re.compile(r'^\s+([0-9a-fA-F]{16}):\s+(.*)$')
 
 
-def canon_user_slice(build: Path, cst: Path) -> str:
+def canon_user_slice(build: Path, cst: Path, isa: str = "x86_64") -> str:
     """Canonical CP-user-slice of a system trace's template dump: for every
-    CP-executed user BB (exec_cp > 0, start_pc < SYS_USER_MAX), emit its
+    CP-executed user BB (exec_cp > 0, start_pc below the ISA's user/kernel
+    split -- SYS_USER_MAX_BY_ISA), emit its
     id-stripped header, its user-range branch targets (counts dropped), and
     its decoded instruction lines (profile annotations dropped), sorted by
     start_pc.  Everything nondeterministic across boots -- kernel BBs, WP-only
     user BBs, exec/profile counts, BB-ids, kernel branch targets -- is masked.
     Byte-identical across independent boots (the determinism verdict above)."""
+    user_max = SYS_USER_MAX_BY_ISA[isa]
     txt = decode_text(build, cst, "templates")
     blocks: dict[int, list[str]] = {}
     cur = None
@@ -1040,7 +1145,7 @@ def canon_user_slice(build: Path, cst: Path) -> str:
         if m:
             flush()
             cur = int(m.group(2), 16)
-            cur_user = cur < SYS_USER_MAX
+            cur_user = cur < user_max
             exec_cp = 0
             cur_lines = [f"BB {m.group(2)} insns={m.group(3)} "
                          f"fall_through={m.group(4)}"]
@@ -1053,7 +1158,7 @@ def canon_user_slice(build: Path, cst: Path) -> str:
             continue
         mt = _TARGET_RE.match(line)
         if mt:
-            if int(mt.group(1), 16) < SYS_USER_MAX:
+            if int(mt.group(1), 16) < user_max:
                 cur_lines.append(f"  target pc={mt.group(1)}")
             continue
         mi = _INSN_RE.match(line)
@@ -1396,6 +1501,58 @@ def sys_capture(build: Path, root: Path, waivers: dict) -> int:
             print(f"  canon:{name}: deterministic CP-user-slice, "
                   f"arch/user={sum(apu) / len(apu):.1f}")
 
+    # (3) validator-run canon cells for the non-x86 ISAs.  A cell this host
+    # cannot boot is EXCLUDED and fails the capture: a reference that quietly
+    # covers fewer ISAs than it names is the shape this net exists to refuse.
+    for c in SYSVAL_CELLS:
+        name, isa = c["name"], c["isa"]
+        why = sysval_assets_missing(isa, build)
+        if why:
+            manifest["excluded"][f"canon:{name}"] = why
+            print(f"  EXCLUDE canon:{name}: {why}")
+            bad += 1
+            continue
+        hs = []
+        apu = []
+        for i in range(SYS_N_DET):
+            cst = sysval_trace_once(build, isa, root / name, f"{name}_{i}")
+            hs.append(sha(canon_user_slice(build, cst, isa).encode())
+                      if cst else None)
+            if cst is None:
+                continue
+            # Same escaped-wedge baseline the devio cells carry: a capture
+            # that wedged and then finished anyway reproduces the user slice
+            # exactly -- which is why the byte net cannot see it -- while
+            # dragging a multiple of the healthy architectural instruction
+            # count behind it.  Both terms are wire counts, so the verdict
+            # does not depend on how busy the host was.
+            h = sys_health(root / name / f"{name}_{i}" / f"{name}_{i}_{isa}")
+            if h is None:
+                hs[-1] = None
+                print(f"  canon:{name}: run {i} produced no plugin "
+                      f"accounting -- cannot record the escaped-wedge "
+                      f"baseline")
+            else:
+                apu.append(h["arch_per_user"])
+        if any(h is None for h in hs):
+            manifest["excluded"][f"canon:{name}"] = "trace not produced"
+            print(f"  EXCLUDE canon:{name}: trace missing")
+            bad += 1
+            continue
+        if any(h != hs[0] for h in hs[1:]):
+            manifest["excluded"][f"canon:{name}"] = \
+                f"CP-user-slice nondeterministic over {SYS_N_DET} runs"
+            print(f"  EXCLUDE canon:{name}: NONDETERMINISTIC user-slice")
+            bad += 1
+            continue
+        manifest["canon_cells"][name] = {
+            "canon": hs[0], "isa": isa,
+            "arch_per_user": sum(apu) / len(apu),
+            "arch_per_user_runs": apu,
+        }
+        print(f"  canon:{name}: deterministic CP-user-slice, "
+              f"arch/user={sum(apu) / len(apu):.1f}")
+
     SYS_MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True))
     print(f"\ncaptured {len(manifest['fixture_decode'])} decode + "
           f"{len(manifest['canon_cells'])} canon cells, "
@@ -1446,6 +1603,14 @@ def sys_check(build: Path, root: Path, waivers: dict) -> int:
 
     # (2) canon-retrace net.
     canon_cells = manifest.get("canon_cells", {})
+    # Every recorded cell must be one this harness can trace.  A recorded
+    # cell with no definition used to fall through a bare `continue`, and
+    # the GREEN line below counted it anyway.
+    defined = {c["name"] for c in SYS_CELLS} | {c["name"] for c in SYSVAL_CELLS}
+    for name in sorted(set(canon_cells) - defined):
+        fails.append(f"canon:{name}: recorded in the manifest but this "
+                     f"harness has no definition for it -- NOT verified")
+    verified: list[str] = []
     if canon_cells:
         kernel, initrd = sys_assets(freeze=False)
         if kernel is None:
@@ -1465,6 +1630,10 @@ def sys_check(build: Path, root: Path, waivers: dict) -> int:
                     fails.append(f"canon:{name}: trace not produced")
                     continue
                 got = sha(canon_user_slice(build, cst).encode())
+                verified.append(name)
+                print(f"  canon:{name}: {got[:16]} "
+                      f"{'==' if got == want['canon'] else '!='} reference "
+                      f"{want['canon'][:16]}")
                 if got != want["canon"]:
                     fails.append(f"canon:{name}: CP-user-slice mismatch "
                                  f"(plugin trace-generation changed)")
@@ -1520,6 +1689,59 @@ def sys_check(build: Path, root: Path, waivers: dict) -> int:
                         f"advanced inside the segment), so nothing watched "
                         f"this capture for a wedge")
 
+    # (3) validator-run canon cells for the non-x86 ISAs.  A cell this host
+    # cannot boot is a FAILURE with its reason, never a skip: the reference
+    # records it, so a GREEN without it would claim coverage it did not have.
+    for c in SYSVAL_CELLS:
+        name, isa = c["name"], c["isa"]
+        want = canon_cells.get(name)
+        if want is None:
+            continue
+        why = sysval_assets_missing(isa, build)
+        if why:
+            fails.append(f"canon:{name}: cannot run on this host ({why}) -- "
+                         f"the reference records this cell, so this run "
+                         f"does NOT verify it")
+            continue
+        cst = sysval_trace_once(build, isa, root / name, f"{name}_chk")
+        if cst is None:
+            fails.append(f"canon:{name}: trace not produced")
+            continue
+        got = sha(canon_user_slice(build, cst, isa).encode())
+        verified.append(name)
+        print(f"  canon:{name}: {got[:16]} "
+              f"{'==' if got == want['canon'] else '!='} reference "
+              f"{want['canon'][:16]}")
+        if got != want["canon"]:
+            fails.append(f"canon:{name}: CP-user-slice mismatch "
+                         f"(plugin trace-generation changed)")
+        base_apu = want.get("arch_per_user")
+        h = sys_health(root / name / f"{name}_chk" / f"{name}_chk_{isa}")
+        if h is None:
+            fails.append(f"canon:{name}: no plugin accounting -- the "
+                         f"escaped-wedge check could not run, which is a "
+                         f"failure, not a pass")
+        elif base_apu is None:
+            fails.append(f"canon:{name}: reference carries no arch/user "
+                         f"baseline; re-capture")
+        elif h["arch_per_user"] > base_apu * SYS_ARCH_PER_USER_TOL:
+            fails.append(
+                f"canon:{name}: {h['arch_per_user']:.0f} architectural insns "
+                f"per workload insn against a {base_apu:.0f} baseline "
+                f"(>{SYS_ARCH_PER_USER_TOL}x) -- the capture wedged and "
+                f"finished anyway")
+        elif h.get("stall_detector") == "INERT":
+            fails.append(
+                f"canon:{name}: the #61 progress detector reported itself "
+                f"INERT, so nothing watched this capture for a wedge")
+
+    # The count the GREEN line states is the count this run TRACED and
+    # compared, and it must be every recorded cell.
+    unverified = sorted(set(canon_cells) - set(verified))
+    if unverified and not fails:
+        fails.append(f"canon: {len(unverified)} recorded cell(s) were not "
+                     f"traced by this run: {', '.join(unverified)}")
+
     # A net with an empty guard is not a green net, it is an unverified one.
     # The canon-retrace cell is the ONLY guard on the plugin's system-mode
     # trace generation (the fixture-decode cell guards the decoder against
@@ -1544,7 +1766,8 @@ def sys_check(build: Path, root: Path, waivers: dict) -> int:
         return 1
     print(f"\nSYSTEM GOLDEN NET GREEN: "
           f"{len(manifest.get('fixture_decode', {}))} decode + "
-          f"{len(canon_cells)} canon cells byte-identical")
+          f"{len(verified)} of {len(canon_cells)} recorded canon cells "
+          f"traced and byte-identical")
     return 0
 
 

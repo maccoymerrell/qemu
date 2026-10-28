@@ -1526,6 +1526,33 @@ def _final_entry_memop_probe(cst: Path):
                     f"{want[0]} in that range")
 
 
+def _isa_loop_outcome(all_ok: bool, subs: list, desc: str) -> Outcome:
+    """Verdict of a per-ISA feature loop, in the order `all` uses: a real
+    failure outranks a skip, and a skip outranks success.
+
+    A check without a subject must not pass.  These loops used to record an
+    absent cross-compiler AND a failed workload build as ``"ok": True`` and
+    then return "pass" from ``all_ok`` alone, so on a host with no cross
+    toolchain three features reported green having measured nothing.  An
+    ISA whose compiler is absent is now an explicit SKIP subcheck
+    (``"ok": False, "skipped": True``), and any skipped ISA makes the whole
+    check "skip" -- not-green, exactly as ``all`` returns RC_SKIP when any
+    requested ISA could not be hosted; a failed build is a FAIL.  A loop
+    that produced no subcheck at all has no subject and fails."""
+    if not subs:
+        return Outcome("fail", f"no ISA was examined -- no subject\n{desc}",
+                       subs)
+    if not all_ok:
+        return Outcome("fail", desc, subs)
+    skipped = [s["name"] for s in subs if s.get("skipped")]
+    if skipped:
+        return Outcome("skip", f"not run for {', '.join(skipped)} "
+                               f"(host cannot build them); "
+                               f"{len(subs) - len(skipped)}/{len(subs)} "
+                               f"ISAs measured\n{desc}", subs)
+    return Outcome("pass", desc, subs)
+
+
 def _chk_reg_snap_accounting(ctx: Ctx) -> Outcome:
     """The plugin's own dropped-slice completeness invariant (Oracle 1 of
     the two D4-class completeness checks — see features.final_entry_memops
@@ -1578,9 +1605,10 @@ def _chk_reg_snap_accounting(ctx: Ctx) -> Outcome:
         # compiler is INSTALLED, which is a PATH lookup.
         cc = M.ISA_COMPILER.get(isa)
         if not cc or not M._have(cc):
-            subs.append({"name": isa, "ok": True,
-                         "detail": f"skip ({cc or 'no compiler'} not in PATH "
-                                   f"-- this host cannot build {isa})"})
+            subs.append({"name": isa, "ok": False, "skipped": True,
+                         "detail": f"SKIP ({cc or 'no compiler'} not in PATH "
+                                   f"-- this host cannot build {isa}; "
+                                   f"nothing measured)"})
             continue
         params = G.GenerateParams(seed=ctx.seed, isa=isa, num_diamonds=8,
                                   hot_iters=1000)
@@ -1588,7 +1616,13 @@ def _chk_reg_snap_accounting(ctx: Ctx) -> Outcome:
         binp = d / f"rsa_{isa}"
         bcmd = [cc] + M.ISA_CFLAGS[isa] + ["-O1", str(src), "-o", str(binp)]
         if subprocess.call(bcmd) != 0:
-            subs.append({"name": isa, "ok": True, "detail": "skip (build failed)"})
+            # The compiler is installed and refused the generated program:
+            # that is a defect (generator or toolchain flags), not an
+            # unhostable run, and it leaves this ISA with no subject.
+            subs.append({"name": isa, "ok": False,
+                         "detail": "FAIL (workload build failed; "
+                                   "nothing measured)"})
+            all_ok = False
             continue
         qemu = ctx.build_dir / f"qemu-{isa}"
         out_base = d / f"rsa_{isa}"
@@ -1633,10 +1667,10 @@ def _chk_reg_snap_accounting(ctx: Ctx) -> Outcome:
                     "detail": f"dropped={dropped} (end_close={end_close}) "
                               f"reg_deltas_discarded={discarded} "
                               f"trimmed={trimmed}"})
-    return Outcome("pass" if all_ok else "fail",
-                   "plugin's own dropped-slice accounting invariant "
-                   "(no slice dropped, end-marker close included), read "
-                   "from <outfile>.stats.log (4 ISAs)", subs)
+    return _isa_loop_outcome(all_ok, subs,
+                             "plugin's own dropped-slice accounting invariant "
+                             "(no slice dropped, end-marker close included), "
+                             "read from <outfile>.stats.log (4 ISAs)")
 
 
 def _chk_final_entry_memops(ctx: Ctx) -> Outcome:
@@ -1674,9 +1708,10 @@ def _chk_final_entry_memops(ctx: Ctx) -> Outcome:
         # compiler is INSTALLED, which is a PATH lookup.
         cc = M.ISA_COMPILER.get(isa)
         if not cc or not M._have(cc):
-            subs.append({"name": isa, "ok": True,
-                         "detail": f"skip ({cc or 'no compiler'} not in PATH "
-                                   f"-- this host cannot build {isa})"})
+            subs.append({"name": isa, "ok": False, "skipped": True,
+                         "detail": f"SKIP ({cc or 'no compiler'} not in PATH "
+                                   f"-- this host cannot build {isa}; "
+                                   f"nothing measured)"})
             continue
         # Long-running so the icount window closes mid-flight; dense enough
         # in load/store blocks that most stops land on a memop-carrying BB.
@@ -1686,7 +1721,13 @@ def _chk_final_entry_memops(ctx: Ctx) -> Outcome:
         binp = d / f"fem_{isa}"
         if subprocess.call([cc] + M.ISA_CFLAGS[isa] +
                            ["-O1", str(src), "-o", str(binp)]) != 0:
-            subs.append({"name": isa, "ok": True, "detail": "skip (build failed)"})
+            # The compiler is installed and refused the generated program:
+            # that is a defect (generator or toolchain flags), not an
+            # unhostable run, and it leaves this ISA with no subject.
+            subs.append({"name": isa, "ok": False,
+                         "detail": "FAIL (workload build failed; "
+                                   "nothing measured)"})
+            all_ok = False
             continue
         qemu = ctx.build_dir / f"qemu-{isa}"
         verdict, detail, used_stop = "none", "no window closed OK", 0
@@ -1721,9 +1762,9 @@ def _chk_final_entry_memops(ctx: Ctx) -> Outcome:
         all_ok = all_ok and ok
         subs.append({"name": isa, "ok": ok,
                      "detail": f"stop={used_stop} {verdict}: {detail}"})
-    return Outcome("pass" if all_ok else "fail",
-                   "segment-final body entry keeps its memops (4 ISAs, "
-                   "deferred icount-window close)", subs)
+    return _isa_loop_outcome(all_ok, subs,
+                             "segment-final body entry keeps its memops "
+                             "(4 ISAs, deferred icount-window close)")
 
 
 def _static_cov_analyze(cst: Path):
@@ -1829,9 +1870,10 @@ def _chk_static_coverage(ctx: Ctx) -> Outcome:
         # compiler is INSTALLED, which is a PATH lookup.
         cc = M.ISA_COMPILER.get(isa)
         if not cc or not M._have(cc):
-            subs.append({"name": isa, "ok": True,
-                         "detail": f"skip ({cc or 'no compiler'} not in PATH "
-                                   f"-- this host cannot build {isa})"})
+            subs.append({"name": isa, "ok": False, "skipped": True,
+                         "detail": f"SKIP ({cc or 'no compiler'} not in PATH "
+                                   f"-- this host cannot build {isa}; "
+                                   f"nothing measured)"})
             continue
         params = G.GenerateParams(seed=ctx.seed, isa=isa, num_diamonds=8,
                                   hot_iters=200)
@@ -1839,7 +1881,13 @@ def _chk_static_coverage(ctx: Ctx) -> Outcome:
         binp = d / f"wpc_{isa}"
         bcmd = [cc] + M.ISA_CFLAGS[isa] + ["-O1", str(src), "-o", str(binp)]
         if subprocess.call(bcmd) != 0:
-            subs.append({"name": isa, "ok": True, "detail": "skip (build failed)"})
+            # The compiler is installed and refused the generated program:
+            # that is a defect (generator or toolchain flags), not an
+            # unhostable run, and it leaves this ISA with no subject.
+            subs.append({"name": isa, "ok": False,
+                         "detail": "FAIL (workload build failed; "
+                                   "nothing measured)"})
+            all_ok = False
             continue
         qemu = ctx.build_dir / f"qemu-{isa}"
         win = "trace_window=icount:start=0;stop=200000"
@@ -1873,9 +1921,10 @@ def _chk_static_coverage(ctx: Ctx) -> Outcome:
             f"btb={a_on['btb_res']}/{a_on['btb_tot']} | "
             f"teeth off_minted={a_off['n_static']} "
             f"off_succ_res={a_off['alt_succ_res']}")})
-    return Outcome("pass" if all_ok else "fail",
-                   "minted-alternate fall-through + BTB coverage, "
-                   "static_depth-deepened (4 ISAs, minting-off teeth)", subs)
+    return _isa_loop_outcome(all_ok, subs,
+                             "minted-alternate fall-through + BTB coverage, "
+                             "static_depth-deepened (4 ISAs, minting-off "
+                             "teeth)")
 
 
 def _chk_lldet_watchdog(ctx: Ctx) -> Outcome:

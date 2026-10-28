@@ -20,7 +20,6 @@ tests = {
   'test-string-output-visitor': [testqapi],
   'test-visitor-serialization': [testqapi],
   'test-bitmap': [],
-  'test-timer-rearm-bound': [],
   'test-resv-mem': [],
   # all code tested by test-x86-topo is inside topology.h
   'test-x86-topo': [],
@@ -50,6 +49,15 @@ tests = {
   'test-interval-tree': [],
   'test-fifo': [],
 }
+
+# util/qemu-timer.c is only in libqemuutil when the block layer or the guest
+# agent is built (util/meson.build), so a linux-user-only configure has no
+# timer list for this test to link against.
+if have_block or have_ga
+  tests += {
+    'test-timer-rearm-bound': [],
+  }
+endif
 
 if have_system or have_tools
   tests += {

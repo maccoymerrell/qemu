@@ -335,12 +335,20 @@ sanity check.
    2.12 encoding_maps_section : section    ; see Step 3 for inner shape
    2.13 warmup_end_trace_insn_idx : ULEB
         The TRACE-POSITION index of the warmup→simulation
-        boundary: the number of in-trace instructions (the sum of
-        each BODY_TAG_ENTRY's template `n_insns`, fan-out records
-        included) that precede the first simulation-phase record.
-        A consumer walking body records and summing template
-        `n_insns` enters the simulation phase the moment that sum
-        reaches this value.
+        boundary: the number of in-trace instructions that precede
+        the first simulation-phase record, counted as the sum of
+        each correct-path BODY_TAG_ENTRY's executed range width,
+        `bb_stop - bb_start` (§4.2a).  The width, not the
+        template's `n_insns`: an entry is billed at emit for the
+        range it declares, so a cut final entry, a resumed fault
+        continuation and a rep-split continuation each count only
+        the instructions their range names.  Each per-iteration
+        record of a fan-out instruction is an entry of its own
+        one-instruction self-loop block and counts 1.  The
+        wrong-path records an entry carries, and the non-entry
+        body tags, count nothing.  A consumer walking body records
+        and summing range widths enters the simulation phase at
+        the first entry whose preceding sum equals this value.
 
         This is NOT an architectural warmup depth.  The segment
         budgets (`warmup_insns`, `total_target_insns`) are
@@ -374,11 +382,23 @@ sanity check.
         The rule is generic over fan-out families (x86 REP today;
         AArch64 MOPS when its architectural facts land).
 
-        Sentinel ULEB-encoded `UINT64_MAX` = the warmup boundary
-        was not crossed in this segment (the trace was cut short,
-        e.g. by guest exit, before warmup elapsed; the whole
-        trace is warmup).  0 = warmup ends immediately (no
-        warmup configured, e.g. non-simpoint icount mode).
+        The crossing is decided on the window clock against the
+        segment's own `warmup_insns` (field 2.5 — the clamped
+        value on a clamped simpoint segment), and the index is
+        placed at the first correct-path entry emitted at or after
+        it.  Sentinel ULEB-encoded `UINT64_MAX` = no boundary was
+        placed in this segment, and every record in it is warmup.
+        Three cases write it: the segment ended before its window
+        clock reached `warmup_insns` (cut short, e.g. by guest
+        exit); the clock crossed but no correct-path entry was
+        emitted after the crossing before the segment closed; or
+        the clock crossed while a fan-out instruction was still in
+        flight and the segment closed before that instruction's
+        records ended, so no placement existed that would not
+        split it (the run reports this last case on stderr and in the
+        `warmup boundary unplaced at finish` statistic).  0 = the boundary
+        sits before the first entry: no warmup applies to the
+        segment (`warmup_insns` = 0, every non-simpoint window).
    2.14 templates section := raw payload to end-of-member (no outer
         length-prefix; the templates section runs to the header
         member's EOF).  Decode per Step 4.

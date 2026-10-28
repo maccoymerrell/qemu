@@ -345,8 +345,8 @@ OPC_BPOSGE64	jump.cond
 OPC_BALC	-	major opcode 0x3A is BALC on Release 6 and the coprocessor-2 store SWC2 before it; the decode site states each arm
 OPC_BGEZAL	call
 OPC_BGEZALL	call
-OPC_BGTZALC	call
-OPC_BLEZALC	call
+OPC_BGTZALC	-	major opcode 0x07 is BGTZ on every release (rt = 0) and, on Release 6 only, BGTZALC/BLTZALC (a call) or BLTUC (no link); the decode site states each arm
+OPC_BLEZALC	-	major opcode 0x06 is BLEZ on every release (rt = 0) and, on Release 6 only, BLEZALC/BGEZALC (a call) or BGEUC (no link); the decode site states each arm
 OPC_BLTZAL	call
 OPC_BLTZALL	call
 OPC_JAL	call

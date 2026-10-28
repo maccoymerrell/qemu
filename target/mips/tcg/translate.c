@@ -15340,22 +15340,37 @@ static bool decode_opc_legacy(CPUMIPSState *env, DisasContext *ctx)
         }
         break;
     case OPC_BLEZALC: /* OPC_BGEZALC, OPC_BGEUC, OPC_BLEZ */
+        /*
+         * One label, up to four instructions.  With rt = 0 these bytes are
+         * BLEZ on every release: a conditional branch that links nothing.
+         * Only Release 6 gives rt != 0 a meaning, and only two of its three
+         * forms link: rs = 0 is BLEZALC and rs = rt is BGEZALC, while any
+         * other pair is the unsigned compare BGEUC.  The label's table row
+         * can name one word, so it names none and each arm states its own.
+         * OPC_BGTZALC below is the same collision at major opcode 0x07.
+         */
         if (rt == 0) {
             /* OPC_BLEZ */
+            insn_dataflow_note_word(INSN_DF_WORD_JUMP_COND);
             gen_compute_branch(ctx, op, 4, rs, rt, imm << 2, 4);
         } else {
             check_insn(ctx, ISA_MIPS_R6);
             /* OPC_BLEZALC, OPC_BGEZALC, OPC_BGEUC */
+            insn_dataflow_note_word(rs == 0 || rs == rt ? INSN_DF_WORD_CALL
+                                                        : INSN_DF_WORD_JUMP_COND);
             gen_compute_compact_branch(ctx, op, rs, rt, imm << 2);
         }
         break;
     case OPC_BGTZALC: /* OPC_BLTZALC, OPC_BLTUC, OPC_BGTZ */
         if (rt == 0) {
             /* OPC_BGTZ */
+            insn_dataflow_note_word(INSN_DF_WORD_JUMP_COND);
             gen_compute_branch(ctx, op, 4, rs, rt, imm << 2, 4);
         } else {
             check_insn(ctx, ISA_MIPS_R6);
             /* OPC_BGTZALC, OPC_BLTZALC, OPC_BLTUC */
+            insn_dataflow_note_word(rs == 0 || rs == rt ? INSN_DF_WORD_CALL
+                                                        : INSN_DF_WORD_JUMP_COND);
             gen_compute_compact_branch(ctx, op, rs, rt, imm << 2);
         }
         break;

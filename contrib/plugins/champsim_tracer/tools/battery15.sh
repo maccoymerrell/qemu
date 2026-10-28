@@ -36,7 +36,7 @@
 #    2-5  smoke x4 ISAs              run + strict decode + audit + vacuity,
 #                                    every trace compressed, read from
 #                                    cst_audit's own member line
-#    6  must0_scan                   every "MUST BE 0" row in EVERY sidecar
+#    6  must0_scan                   every "(must be 0)" row in EVERY sidecar
 #                                    this run produces -- see the scope note
 #    6w   ... THE DECLARED WIDER      the same scan over the sidecar
 #           POPULATION                populations this run did NOT produce:
@@ -760,7 +760,10 @@ run_row6b() {
     local d=$O/must0_plant
     rm -rf "$d"; mkdir -p "$d"
     printf 'PLANTED CONTROL -- not a tracer sidecar\n' > "$d/plant.stats.log"
-    printf '         7  a row this control invented -- MUST BE 0\n' \
+    # The plant is written in the plugin's own row shape ("%-40s %" PRIu64,
+    # label ending "(must be 0)"), so the fire proves the scanner reads the
+    # rows the plugin actually writes.
+    printf '%-40s %s\n' 'a row this control invented (must be 0)' 7 \
         >> "$d/plant.stats.log"
     "$PY" "$T/arc3_cov/instruments/must0_scan.py" --min-subjects 1 \
           "$d/plant.stats.log" > "$O/MUST0_PLANT.txt" 2>&1
@@ -1004,7 +1007,11 @@ run_row6() {
     # says are there, which is the thing the floor exists to catch.
     #
     local c
-    c=$(grep -lF 'MUST BE 0' "${M0[@]}" 2>/dev/null | wc -l)
+    # The marker is the plugin's own spelling, "(must be 0)" / "...; must be
+    # 0)" -- lower case.  This grep used to look for "MUST BE 0", which the
+    # plugin has never written, so c was 0 on every real sidecar and the row
+    # refused for want of a subject that was sitting in every file.
+    c=$(grep -lF 'must be 0)' "${M0[@]}" 2>/dev/null | wc -l)
     if [ "$c" -eq 0 ]; then
         record 6 2 "must0_scan -- $n sidecar(s) found and NONE carries a" \
                "must-be-0 census.  The census is written by the validator's" \

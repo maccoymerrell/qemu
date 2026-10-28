@@ -16,10 +16,28 @@ was believed for a night:
 Both shapes are in the same file, so a reader that handles one and not the
 other is not a reader.  This is the one location; batteries cite this path.
 
-THE RULE.  A row's count is the leading integer of the line the row's TEXT
-begins on -- the phrase line itself when the phrase starts the row, otherwise
-the nearest preceding line that starts with an integer, within the height of
-one wrapped row.
+THE ROW SHAPE IS THE PLUGIN'S, AND IT IS LOWER CASE.  This scanner used to
+match "MUST BE 0" and read the leading integer of the row.  The plugin has
+never written that phrase into a sidecar: champsim_tracer_stats_report.cc
+renders every census row as "%-40s %" PRIu64 with the label ending in
+"(must be 0)", so the count TRAILS the phrase.  Against a real land_verify
+sidecar carrying 30 such rows the old reader found 0 and named every file
+"no subject"; only planted rows written in its own invented shape ever
+reached it.  The plugin writes two shapes, and both are read:
+
+  * TRAILING  -- "<label> (must be 0)   <count>": the census table rows.
+  * INLINE    -- "<label>   <count>   (<note>; must be 0)": the count before
+    a parenthetical that ends in the phrase (the register-route census).
+
+THE RULE.  A row is a line carrying the phrase "must be 0)" exactly as the
+plugin spells it.  Its count is the integer after the closing parenthesis
+when one follows it, otherwise the last integer before the parenthetical
+that holds the phrase.  A row whose count matches neither is reported with
+count "?" and is RED, never skipped.
+
+THE SHAPE GUARD.  A file in which the phrase appears in ANY case more often
+than this reader recognised a row has drifted from the shape above -- the
+exact failure that made the old reader silent -- and FAILS, naming the lines.
 
 WHAT IS *NOT* A MUST-BE-0 ROW, stated because two census columns are now
 honestly non-zero and reading them as red would be a false alarm:
@@ -40,11 +58,11 @@ honestly non-zero and reading them as red would be a false alarm:
 
 None of those lines carries the phrase, so none is scanned here.  That is the
 membership rule and not a special case: a column is a must-be-0 row exactly
-when the plugin writes "MUST BE 0" in its own text.
+when the plugin writes "(must be 0)" in its own text.
 
-Exit 1 when any row is non-zero, or when the run found FEWER THAN
---min-subjects files carrying a must-be-0 row: a scanner that cannot find its
-subject FAILS.  Exit 2 on a usage or selftest failure.
+Exit 1 when any row is non-zero or unreadable, when a file fails the shape
+guard, or when the run found FEWER THAN --min-subjects files carrying a
+must-be-0 row: a scanner that cannot find its subject FAILS.  Exit 2 on a usage or selftest failure.
 
 WHY THE SUBJECT RULE IS ABOUT THE RUN AND NOT ABOUT EACH FILE.  It used to
 be per file, which was right while callers named four sidecars they knew
@@ -70,25 +88,31 @@ import re
 import sys
 import tempfile
 
-LEAD = re.compile(r'^\s*(\d+)\s+\S')
-WRAP_HEIGHT = 4          # a wrapped row is at most this many lines tall
+PHRASE = 'must be 0)'
+# TRAILING: "<label> (must be 0)   <count>"
+TRAILING = re.compile(r'^(?P<label>.*\(must be 0\))\s+(?P<val>\d+)\s*$')
+# INLINE: "<label>   <count>   (<note>; must be 0)"
+INLINE = re.compile(r'^(?P<label>.*?)\s(?P<val>\d+)\s+\([^()]*must be 0\)\s*$')
+ANY_CASE = re.compile(r'must be 0', re.IGNORECASE)
+
+
+def scan_lines(lines):
+    """-> ([(count|None, text)] rows, [unrecognised phrase lines])."""
+    rows = []
+    drift = []
+    for ln in lines:
+        if PHRASE in ln:
+            m = TRAILING.match(ln) or INLINE.match(ln)
+            rows.append((int(m.group('val')) if m else None,
+                         ln.strip()[:70]))
+        elif ANY_CASE.search(ln):
+            drift.append(ln.strip()[:70])
+    return rows, drift
 
 
 def scan(path):
     """-> [(count|None, text)] for every must-be-0 row in @path."""
-    rows = []
-    lines = open(path, errors='replace').read().splitlines()
-    for i, ln in enumerate(lines):
-        if 'MUST BE 0' not in ln:
-            continue
-        for j in range(i, max(-1, i - WRAP_HEIGHT), -1):
-            m = LEAD.match(lines[j])
-            if m:
-                rows.append((int(m.group(1)), lines[j].strip()[:70]))
-                break
-        else:
-            rows.append((None, ln.strip()[:70]))
-    return rows
+    return scan_lines(open(path, errors='replace').read().splitlines())[0]
 
 
 def report(paths, quiet=False, min_subjects=1):
@@ -104,7 +128,18 @@ def report(paths, quiet=False, min_subjects=1):
                   'fails' % p)
             rc = 1
             continue
-        rows = scan(p)
+        rows, drift = scan_lines(
+            open(p, errors='replace').read().splitlines())
+        if drift:
+            # The phrase is there in a shape this reader does not know.  An
+            # unrecognised census is the silence this file exists to end.
+            print('%s: SHAPE DRIFT -- %d line(s) carry "must be 0" in a '
+                  'shape this reader does not recognise as a row (it reads '
+                  '"%s" exactly as the plugin spells it):'
+                  % (p, len(drift), PHRASE))
+            for t in drift[:10]:
+                print('     drift: %s' % t)
+            rc = 1
         if not rows:
             empty.append(p)
             continue
@@ -145,18 +180,19 @@ def report(paths, quiet=False, min_subjects=1):
 # Each arm below is one way this reader has actually been wrong.
 _SHAPE_A = """\
 tracer statistics
-        12  something unrelated
-         0  spec_mode_leak                                (MUST BE 0)
-         0  close_in_mid_step                             (MUST BE 0)
+something unrelated                      12
+  >1 in one seal walk (must be 0)        0
+merge suffix overhung its frame (must be 0) 0
 """
 _SHAPE_B = """\
 tracer statistics
-        12  something unrelated
-         0  a row whose descriptive text is long enough that the marker
-            wraps onto the next line                      (MUST BE 0)
+  from the generated gdbstub table              12
+  from the per-ISA register table               0   (source removed; must be 0)
 """
-_SHAPE_B_RED = _SHAPE_B.replace('         0  a row', '         7  a row')
-_NO_SUBJECT = "tracer statistics\n        12  something unrelated\n"
+_SHAPE_B_RED = _SHAPE_B.replace('table               0', 'table               7')
+_NO_SUBJECT = "tracer statistics\nsomething unrelated                      12\n"
+# The shape the old reader matched and the plugin never wrote.
+_DRIFT = "tracer statistics\n         0  invented row  (MUST BE 0)\n"
 
 
 def selftest():
@@ -170,23 +206,23 @@ def selftest():
     a = w('a.log', _SHAPE_A)
     rows = scan(a)
     if [r[0] for r in rows] != [0, 0]:
-        print('ARM 1 FAILED: plain shape read %r' % rows); ok = False
+        print('ARM 1 FAILED: trailing shape read %r' % rows); ok = False
     else:
-        print('ARM 1 ok: plain rows read 0, 0')
+        print('ARM 1 ok: trailing-count rows read 0, 0, not the 12 above')
 
     b = w('b.log', _SHAPE_B)
     rows = scan(b)
     if [r[0] for r in rows] != [0]:
-        print('ARM 2 FAILED: WRAPPED shape read %r -- this is the shape a '
-              'phrase-line-only reader misses' % rows); ok = False
+        print('ARM 2 FAILED: INLINE shape read %r -- the count before a '
+              'parenthetical ending in the phrase' % rows); ok = False
     else:
-        print('ARM 2 ok: wrapped row read 0, not the 12 above it')
+        print('ARM 2 ok: inline row read 0, not the 12 above it')
 
     br = w('bred.log', _SHAPE_B_RED)
     if report([br], quiet=True) == 0:
-        print('ARM 3 FAILED: a non-zero wrapped row passed'); ok = False
+        print('ARM 3 FAILED: a non-zero inline row passed'); ok = False
     else:
-        print('ARM 3 ok: non-zero wrapped row FAILS')
+        print('ARM 3 ok: non-zero inline row FAILS')
 
     n = w('none.log', _NO_SUBJECT)
     if report([n], quiet=True) == 0:
@@ -223,7 +259,17 @@ def selftest():
     else:
         print('ARM 5 ok: missing file FAILS')
 
-    print('SELFTEST %s -- 8 arms' % ('PASSED' if ok else 'FAILED'))
+    # ARM 6: the shape guard -- the phrase in a shape this reader does not
+    # know (the old reader's own invented "MUST BE 0") is red even beside a
+    # real census, never a file with "no subject".
+    dr = w('drift.log', _DRIFT)
+    if report([dr, a], quiet=True) == 0:
+        print('ARM 6 FAILED: an unrecognised must-be-0 shape passed')
+        ok = False
+    else:
+        print('ARM 6 ok: an unrecognised must-be-0 shape FAILS')
+
+    print('SELFTEST %s -- 9 arms' % ('PASSED' if ok else 'FAILED'))
     return 0 if ok else 2
 
 

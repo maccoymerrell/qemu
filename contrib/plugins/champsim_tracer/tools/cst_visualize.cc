@@ -4334,10 +4334,19 @@ int main(int argc, char **argv)
             if (all_mode) {
                 auto results = process_trace_multi(opts.inputs[0], opts,
                                                    all_metrics());
+                /* Every metric is still rendered, but one that could not
+                 * be written (an unopenable PREFIX__<metric>.svg/.csv)
+                 * makes the run exit 1, as the single-metric mode does.
+                 * The returns used to be dropped and the run exited 0
+                 * with only a stderr line to show for the missing plot. */
+                int rc = 0;
                 for (const auto &r : results) {
-                    render_to_prefix(r.result, r.metric, opts, /*agg=*/false);
+                    if (render_to_prefix(r.result, r.metric, opts,
+                                         /*agg=*/false) != 0) {
+                        rc = 1;
+                    }
                 }
-                return 0;
+                return rc;
             }
             TraceResult tr = process_trace(opts.inputs[0], opts);
             return render_result(tr, opts);
@@ -4437,6 +4446,7 @@ int main(int argc, char **argv)
             std::fprintf(stderr, "cst_visualize: no traces processed\n");
             return 1;
         }
+        int agg_rc = 0;
         for (Metric m : mlist) {
             auto it = per_metric.find((int)m);
             if (it == per_metric.end() || it->second.empty()) continue;
@@ -4450,9 +4460,11 @@ int main(int argc, char **argv)
                 continue;
             }
             TraceResult agg = aggregate_results(it->second, opts);
-            render_to_prefix(agg, m, opts, /*agg=*/true);
+            if (render_to_prefix(agg, m, opts, /*agg=*/true) != 0) {
+                agg_rc = 1;      /* as the single-trace all-metrics pass */
+            }
         }
-        return 0;
+        return agg_rc;
     }
 
     if (metric_is_grid(opts.metric)) {

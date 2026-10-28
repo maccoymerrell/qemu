@@ -310,7 +310,7 @@ def llvm_generic(regs, isa):
         elif r in ("sp", "wsp", "x2"):
             out.add("REG_SP")
         elif r in ("pc", "rip", "eip"):
-            out.add("REG_IP")
+            out.add("REG_PC")
         elif r in ("eflags", "rflags", "flags", "nzcv", "cpsr", "fflags"):
             out.add("REG_FLAGS")
         elif r in ("fcsr", "fpcr", "fpsr", "frm"):

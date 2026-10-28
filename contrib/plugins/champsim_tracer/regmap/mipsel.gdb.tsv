@@ -62,7 +62,7 @@ hi	REG_ACCHI0	MIPS HI is the high half of accumulator 0 and now has an id of its
 k0	REG_GPR26	incumbent: the per-ISA table routed this gdb name here
 k1	REG_GPR27	incumbent: the per-ISA table routed this gdb name here
 lo	REG_ACC0	MIPS LO is the low half of accumulator 0 and REG_ACC0 now means that half alone, so the read publishes a whole register's value under a name that means that register
-pc	REG_IP	incumbent: the per-ISA table routed this gdb name here
+pc	REG_PC	incumbent: the per-ISA table routed this gdb name here
 ra	REG_LR	incumbent: the per-ISA table routed this gdb name here
 s0	REG_GPR16	incumbent: the per-ISA table routed this gdb name here
 s1	REG_GPR17	incumbent: the per-ISA table routed this gdb name here

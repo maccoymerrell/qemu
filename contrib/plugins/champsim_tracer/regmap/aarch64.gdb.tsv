@@ -16,7 +16,7 @@
 # unchanged so E1's deletion of that table loses nothing.
 
 cpsr	REG_FLAGS	incumbent: the per-ISA table routed this gdb name here
-pc	REG_IP	the program counter; Capstone's ARM64 register enum has no PC row, so the incumbent table never named it
+pc	REG_PC	the program counter; Capstone's ARM64 register enum has no PC row, so the incumbent table never named it
 sp	REG_SP	incumbent: the per-ISA table routed this gdb name here
 x0	REG_GPR0	incumbent: the per-ISA table routed this gdb name here
 x1	REG_GPR1	incumbent: the per-ISA table routed this gdb name here

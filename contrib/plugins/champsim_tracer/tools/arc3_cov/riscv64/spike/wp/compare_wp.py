@@ -85,8 +85,8 @@ def adjudicate(rel, only_ref, only_trc, bits, side):
         if only_trc and all(n == 'REG_ZERO' for n in only_trc):
             label = 'REF-X0-DISCARD' if side == 'dst' \
                 else 'REF-C-IMM-NO-X0-READ'
-        elif only_trc and 'REG_IP' in only_trc and \
-                only_trc <= {'REG_IP', 'REG_ZERO'}:
+        elif only_trc and 'REG_PC' in only_trc and \
+                only_trc <= {'REG_PC', 'REG_ZERO'}:
             # THE PROGRAM COUNTER, on the wrong path.  The same rule the CP
             # leg applies, applied here for the reason this function exists.
             # execute.cc's log maps are keyed by a kind field whose switch

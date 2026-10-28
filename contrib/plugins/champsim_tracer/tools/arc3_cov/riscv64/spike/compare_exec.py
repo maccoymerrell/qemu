@@ -372,8 +372,8 @@ def compare_insn(r, t):
         if only_trc and frozenset(rsa) <= tsa:
             if all(n == 'REG_ZERO' for n in only_trc):
                 row = row._replace(label='REF-C-IMM-NO-X0-READ')
-            elif all(n in ('REG_IP', 'REG_ZERO') for n in only_trc) and \
-                    'REG_IP' in only_trc:
+            elif all(n in ('REG_PC', 'REG_ZERO') for n in only_trc) and \
+                    'REG_PC' in only_trc:
                 # THE PROGRAM COUNTER, WHICH SPIKE HAS NO REGISTER FOR.
                 # execute.cc's two log maps are keyed by a kind field whose
                 # switch enumerates x / f / v / vstatus / csr and asserts on
@@ -464,8 +464,8 @@ def compare_insn(r, t):
         if only_trc and frozenset(ra) <= frozenset(ta):
             if all(n == 'REG_ZERO' for n in only_trc):
                 row = row._replace(label='REF-X0-DISCARD')
-            elif all(n in ('REG_IP', 'REG_ZERO') for n in only_trc) and \
-                    'REG_IP' in only_trc:
+            elif all(n in ('REG_PC', 'REG_ZERO') for n in only_trc) and \
+                    'REG_PC' in only_trc:
                 # The WRITE side of the same reference gap: jal / jalr / every
                 # taken branch writes the PC, and spike's log has no kind for
                 # it.  Where REG_ZERO rides along it is the rd == x0 form,

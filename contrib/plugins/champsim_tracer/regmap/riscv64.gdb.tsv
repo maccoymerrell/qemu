@@ -25,7 +25,7 @@ a6	REG_GPR16	incumbent: the per-ISA table routed this gdb name here
 a7	REG_GPR17	incumbent: the per-ISA table routed this gdb name here
 fp	REG_FP_REG	incumbent: the per-ISA table routed this gdb name here
 gp	REG_GPR3	incumbent: the per-ISA table routed this gdb name here
-pc	REG_IP	the program counter; Capstone's RISCV register enum has no PC row, so the incumbent table never named it
+pc	REG_PC	the program counter; Capstone's RISCV register enum has no PC row, so the incumbent table never named it
 ra	REG_LR	incumbent: the per-ISA table routed this gdb name here
 s1	REG_GPR9	incumbent: the per-ISA table routed this gdb name here
 s10	REG_GPR26	incumbent: the per-ISA table routed this gdb name here

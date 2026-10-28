@@ -645,7 +645,7 @@ without implying any particular numeric base.
      - Stack pointer.
    * - ``REG_FLAGS``
      - Flags / condition-code register (RFLAGS, NZCV, ``mstatus``).
-   * - ``REG_IP``
+   * - ``REG_PC``
      - Instruction / program counter.
    * - ``REG_LR``
      - Link register (return address) on architectures that have

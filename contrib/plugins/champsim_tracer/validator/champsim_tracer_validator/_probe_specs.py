@@ -661,7 +661,7 @@ _register_probe('probe_rv_v0_carry_mask', {
             # constant and never calls get_gpr().  The earlier declaration of
             # REG_ZERO here was the probe's error, not the wire's.
             #
-            # REG_IP IS A DESTINATION, per RULING 210-J (see
+            # REG_PC IS A DESTINATION, per RULING 210-J (see
             # docs/limitations.rst, "A translator-forced TB exit"):  vsetvl
             # must end the translation block, so QEMU emits gen_update_pc() +
             # lookup_and_goto_ptr() INSIDE this instruction's dataflow window.
@@ -670,7 +670,7 @@ _register_probe('probe_rv_v0_carry_mask', {
             # so the wire UNDER-reports the PC destination elsewhere and never
             # reports one the machine does not perform.
             {'src': [],
-             'dst': ['REG_GPR5', 'REG_IP', 'REG_VCTRL']},       # vsetvli
+             'dst': ['REG_GPR5', 'REG_PC', 'REG_VCTRL']},       # vsetvli
             {'src': ['REG_VEC4', 'REG_VEC5', 'REG_VEC6', 'REG_VCTRL', 'REG_VEC0'],
              'dst': ['REG_VEC4', 'REG_VCTRL']},                 # vadc.vvm
             {'src': ['REG_VEC7', 'REG_VEC8', 'REG_VEC9', 'REG_VCTRL', 'REG_VEC0'],

@@ -1759,7 +1759,7 @@ def run_selftest():
         # The banked in-tree referee's own rows for retq: implicit
         # rsp+ss reads, rip+rsp writes.
         ("x86_64", "c3", True, "retq", ["REG_SP", "REG_SEG5"],
-         ["REG_IP", "REG_SP"]),
+         ["REG_PC", "REG_SP"]),
         ("aarch64", "e00301aa", True, None, ["REG_GPR1"], ["REG_GPR0"]),
         ("riscv64", "93000000", True, None, None, None),
         ("mipsel", "21100000", True, None, ["REG_ZERO"], ["REG_GPR2"]),

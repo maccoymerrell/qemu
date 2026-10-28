@@ -16,7 +16,7 @@ LO0	REG_ACC0	LO<n> is the low half of accumulator <n>; mfhi and mflo read differ
 LO1	REG_ACC1	LO<n> is the low half of accumulator <n>; mfhi and mflo read different hardware, so the two halves take different ids
 LO2	REG_ACC2	LO<n> is the low half of accumulator <n>; mfhi and mflo read different hardware, so the two halves take different ids
 LO3	REG_ACC3	LO<n> is the low half of accumulator <n>; mfhi and mflo read different hardware, so the two halves take different ids
-PC	REG_IP	arch-role: the program counter
+PC	REG_PC	arch-role: the program counter
 XCR	REG_VCTRL	MXU control register
 XR1	REG_VEC1	MXU register file index
 XR10	REG_VEC10	MXU register file index

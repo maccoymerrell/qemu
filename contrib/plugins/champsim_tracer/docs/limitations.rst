@@ -1033,7 +1033,7 @@ Architectural PC destinations
 -----------------------------
 
 Every instruction changes the program counter; the wire names
-``REG_IP`` as a *destination* only where QEMU's emulation performs
+``REG_PC`` as a *destination* only where QEMU's emulation performs
 the redirect inside that instruction's own dataflow window.  On the
 whole-encoding translate-only corpus all four targets publish the
 destination, from three mechanisms:
@@ -1063,7 +1063,7 @@ the PC architecturally with no wire write — QEMU materialises the
 advance only where control leaves the block.  The trace never names
 a PC write the machine does not perform; it omits ones the machine
 performs implicitly.  A consumer must treat the presence of
-``REG_IP`` in a destination list as "the emulation redirected
+``REG_PC`` in a destination list as "the emulation redirected
 control here", never as a partition of encodings into branch and
 non-branch — the branch taxonomy on the wire is the ``BRANCH_*``
 classification, not this destination bit.

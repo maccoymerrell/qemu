@@ -33,7 +33,7 @@ p6	REG_PRED6	SVE predicate file index
 p7	REG_PRED7	SVE predicate file index
 p8	REG_PRED8	SVE predicate file index
 p9	REG_PRED9	SVE predicate file index
-pc	REG_IP	arch-role: the program counter
+pc	REG_PC	arch-role: the program counter
 r0	REG_GPR0	AArch32 R<n> aliases X<n>
 r1	REG_GPR1	AArch32 R<n> aliases X<n>
 r10	REG_GPR10	AArch32 R<n> aliases X<n>

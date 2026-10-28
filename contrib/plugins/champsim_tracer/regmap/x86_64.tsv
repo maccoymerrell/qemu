@@ -29,7 +29,7 @@ ecx	REG_GPR1	dense-gpr: the 32-bit spelling of the same register
 edi	REG_GPR5	dense-gpr: the 32-bit spelling of the same register
 edx	REG_GPR2	dense-gpr: the 32-bit spelling of the same register
 eflags	REG_FLAGS	arch-name: the flags word
-eip	REG_IP	arch-role: the program counter
+eip	REG_PC	arch-role: the program counter
 es_base	REG_SEG2	segment base: the segment it belongs to
 esi	REG_GPR4	dense-gpr: the 32-bit spelling of the same register
 esp	REG_SP	arch-role: the stack pointer
@@ -65,7 +65,7 @@ rbx	REG_GPR3	dense-gpr: arch number less SP and BP
 rcx	REG_GPR1	dense-gpr: arch number less SP and BP
 rdi	REG_GPR5	dense-gpr: arch number less SP and BP
 rdx	REG_GPR2	dense-gpr: arch number less SP and BP
-rip	REG_IP	arch-role: the program counter
+rip	REG_PC	arch-role: the program counter
 rsi	REG_GPR4	dense-gpr: arch number less SP and BP
 rsp	REG_SP	arch-role: the stack pointer
 ss_base	REG_SEG5	segment base: the segment it belongs to

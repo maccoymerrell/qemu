@@ -889,8 +889,10 @@ static bool reg_is_special_excluded(const std::string &name)
 {
     return (name.find("ZERO") != std::string::npos)
         || (name.find("FLAGS") != std::string::npos)
-        || (name == "REG_IP" || name == "IP"
-            || name == "REG_PC" || name == "PC")
+        || (name == "REG_PC" || name == "PC"
+            /* the spelling of the same id in traces written before the
+             * wire's PC name became REG_PC; a frozen trace still says it */
+            || name == "REG_IP" || name == "IP")
         || (name == "REG_NONE" || name == "NONE");
 }
 

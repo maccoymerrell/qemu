@@ -3164,7 +3164,7 @@ def _check_call_return_store(
     _, branch_names = _load_name_tables()
     call_types = {"BRANCH_DIRECT_CALL", "BRANCH_INDIRECT_CALL",
                   "DIRECT_CALL", "INDIRECT_CALL"}
-    ip_names = {"REG_IP", "IP"}
+    ip_names = {"REG_PC", "IP"}
 
     issues: list[Issue] = []
     n_checked = 0
@@ -3192,7 +3192,7 @@ def _check_call_return_store(
                 "call_return_store", "error",
                 f"template t{tmpl['template_id']} insn #{idx} "
                 f"pc=0x{int(ins['pc']):x}: a call's store-data "
-                f"dependency must name the return address (REG_IP) "
+                f"dependency must name the return address (REG_PC) "
                 f"and only that",
                 {"template_id": int(tmpl["template_id"]),
                  "insn_index": idx,
@@ -4302,7 +4302,7 @@ def _unsupported_reg_coverage(isa: str) -> set[str]:
         },
         "mipsel": {
             "REG_ACC0", "REG_ACC1", "REG_ACC2", "REG_ACC3",
-            "REG_FLAGS", "REG_IP",
+            "REG_FLAGS", "REG_PC",
             "REG_SYS", "REG_VCTRL",
             *(f"REG_PRED{i}" for i in range(32)),
             *(f"REG_VEC{i}" for i in range(32)),
@@ -7873,9 +7873,9 @@ def _check_metaflags(
     # 0xff has even parity -- so the check demanded P=1 and called the
     # wire's correct P=0 an error.  Excluded by NAME, not by value, because
     # the numeric id moves; and by BOTH spellings, because the name has
-    # moved too -- the wire calls it REG_IP at this tip
-    # (champsim_tracer_generic_ids.h: REG_IP = 252) and an earlier tree
-    # called it REG_PC.  Keying on one spelling alone would leave this
+    # moved too -- the wire calls it REG_PC (champsim_tracer_generic_ids.h:
+    # REG_PC = 252), and an earlier tree of this branch printed REG_IP for
+    # the same id.  Keying on one spelling alone would leave this
     # check silently unfixed against a trace that used the other, which is
     # exactly the shape that produced the wild failure:
     #   "expected Z=0/N=0/P=1 from REG_IP=0x401fff".

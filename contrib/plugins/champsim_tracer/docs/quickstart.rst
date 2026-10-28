@@ -727,12 +727,12 @@ below is opt-in because it can substantially grow the trace.
    capture that branch differently.  The CP skips the hook on the
    delay slot that would capture the branch and takes the branch at
    the next TB's ``vcpu_tb_exec`` instead, together with the delay
-   slot, so that the branch's ``REG_IP`` destination can take the
+   slot, so that the branch's ``REG_PC`` destination can take the
    ``goto_tb`` successor (a chained TB leaves the guest PC stale).
    The WP has no next-dispatch capture, so a wrong-path translation
    arms that hook: the branch's destinations (the link register of a
    linking branch) are read at the delay slot's pre-exec, before the
-   delay slot can overwrite them.  Its ``REG_IP`` destination is the
+   delay slot can overwrite them.  Its ``REG_PC`` destination is the
    one value no register holds at that point — a TB writes the guest
    PC back only when it exits — and is taken from the post-``exec_tb``
    read instead, which on the wrong path (``CF_NO_GOTO_TB``, so every
@@ -741,9 +741,9 @@ below is opt-in because it can substantially grow the trace.
    delay-slot branch published its destinations as zero-width zeros:
    on a small static mipsel program (``qemu-mipsel`` under ``env -i``,
    ``wpdepth=64,regdata=1,wp_regdata=1``) 24,218 of 24,482 WP
-   ``REG_IP`` destinations and 3,759 of 4,927 WP ``REG_LR``
+   ``REG_PC`` destinations and 3,759 of 4,927 WP ``REG_LR``
    destinations, every zero-width WP destination in the trace; the
-   fix leaves none.  Of the 24,218 branch ``REG_IP`` values it now
+   fix leaves none.  Of the 24,218 branch ``REG_PC`` values it now
    publishes, 23,928 equal the entry's recorded successor and 284 sit
    in entries that record no successor to compare against.  The other
    6 are wrong-path garbage: 5 jumps whose target carries the MIPS16

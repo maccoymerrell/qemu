@@ -2341,7 +2341,7 @@ shifts the index (the AArch64 register form) or ``index * scale`` for
 one that scales it (the x86 SIB form) — the two are mutually exclusive.
 An x86 RIP-relative operand (``prefetcht0 buf(%rip)``) has no register
 term: the translator folds the next instruction's address into the
-displacement, so ``disp`` is the absolute address, while ``REG_IP``
+displacement, so ``disp`` is the absolute address, while ``REG_PC``
 stays a source of the instruction and a member of the address's
 dependency set.
 The synthesized
@@ -2536,10 +2536,10 @@ visit:
    (``-icount``) reads each iteration live and publishes the same values
    in the same places, so the register content does not depend on how
    QEMU translated the instruction.  Between two iterations the state is
-   the one an interrupt observes there — ``REG_IP`` on the REP and
+   the one an interrupt observes there — ``REG_PC`` on the REP and
    ``EFLAGS.RF`` set, which the looping x86 translation carries through
    the repetition under a plugin — and after the last iteration it is the
-   completed instruction's — ``REG_IP`` past the REP and ``RF`` clear —
+   completed instruction's — ``REG_PC`` past the REP and ``RF`` clear —
    in every regime, the wrong path included: a single-iteration
    translation leaves past the REP on the iteration that exhausts the
    counter, exactly as the loop does.  An iteration whose state could not

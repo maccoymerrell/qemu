@@ -428,7 +428,7 @@ static uint32_t wp_append_fragment_insns(WpAccum &acc, BBTemplate *cur,
                     const InsnRegNames *names = &cur->insn_reg_names[i];
                     size_t base = bb_reg_snaps.size() - f->n_dst_regs;
                     for (uint8_t k = 0; k < f->n_dst_regs; k++) {
-                        if (f->dst_regs[k] == REG_IP) {
+                        if (f->dst_regs[k] == REG_PC) {
                             g_reg_snaps.read_into_snap(
                                 cpu_index, names->dst_qemu_reg_keys[k],
                                 &bb_reg_snaps[base + k]);

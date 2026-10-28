@@ -55,7 +55,7 @@ rbx	REG_GPR3	incumbent: the per-ISA table routed this gdb name here
 rcx	REG_GPR1	incumbent: the per-ISA table routed this gdb name here
 rdi	REG_GPR5	incumbent: the per-ISA table routed this gdb name here
 rdx	REG_GPR2	incumbent: the per-ISA table routed this gdb name here
-rip	REG_IP	incumbent: the per-ISA table routed this gdb name here
+rip	REG_PC	incumbent: the per-ISA table routed this gdb name here
 rsi	REG_GPR4	incumbent: the per-ISA table routed this gdb name here
 rsp	REG_SP	incumbent: the per-ISA table routed this gdb name here
 ss	REG_SEG5	route: the segment SELECTOR is the register the wire names; ss_base is the hidden descriptor half of the same container

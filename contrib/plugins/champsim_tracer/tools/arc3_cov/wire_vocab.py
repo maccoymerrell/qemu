@@ -3,10 +3,9 @@
 WHY THIS EXISTS, AND IT IS NOT TIDINESS.
 
 A comparator's adjudication rules are keyed on the tracer's register NAMES.
-Four of them were keyed on ``REG_PC``, a spelling this branch's wire has
-never used: ``champsim_tracer_generic_ids.h`` defines ``REG_IP = 252`` and
-``cst_generic_reg_name()`` returns the string ``"REG_IP"``.  The rules
-therefore matched nothing, and every row they existed to name was reported
+Four of them were once keyed on ``REG_PC`` while this branch's wire
+printed ``REG_IP`` for id 252 (the wire has since been renamed to
+``REG_PC``, the same id).  The rules therefore matched nothing, and every row they existed to name was reported
 UNACCOUNTED -- the disqualifying column -- while the reason the reference
 could not state the fact was written down two files away.
 

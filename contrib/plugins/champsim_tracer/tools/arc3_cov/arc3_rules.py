@@ -482,7 +482,7 @@ RISCV_EXEC = {
     #
     # The wire does state them, because QEMU does: the PC has a declared
     # regfile target and the decode sites note it, so it reaches the trace
-    # as REG_IP.  Exactly REF-NO-ORDERING-STATE's and REF-NO-XLEN-STATE's
+    # as REG_PC.  Exactly REF-NO-ORDERING-STATE's and REF-NO-XLEN-STATE's
     # shape -- the reference does not model the fact as a register, so it
     # cannot report the dependence -- and it is charged the same way.
     #

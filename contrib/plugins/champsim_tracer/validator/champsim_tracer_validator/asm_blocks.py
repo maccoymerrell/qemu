@@ -69,7 +69,7 @@ class BlockPlan:
     asserted_cond_uncond_branch: bool = False
     # Author-declared per-instruction register sets, parallel to the
     # asm body.  Each entry is {"src": [...], "dst": [...]} naming
-    # GenericRegId values (e.g. "REG_GPR0", "REG_IP") OR a per-ISA
+    # GenericRegId values (e.g. "REG_GPR0", "REG_PC") OR a per-ISA
     # canonical Capstone name we resolve at validation time.  Optional;
     # the validator's _check_static_reg_sets already covers per-insn
     # src/dst correctness against Capstone disassembly, so this is for

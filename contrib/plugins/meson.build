@@ -74,11 +74,13 @@ if get_option('plugins')
                ['aarch64', ['target/arm/tcg/translate.c',
                             'target/arm/tcg/translate-a64.c'],
                             ['gdb-xml/aarch64-core.xml',
-                             'gdb-xml/aarch64-fpu.xml']],
+                             'gdb-xml/aarch64-fpu.xml',
+                             'target/arm/gdbstub64.c']],
                ['riscv64', ['target/riscv/translate.c',
                             'target/riscv/cpu.c'],
                             ['gdb-xml/riscv-64bit-cpu.xml',
-                             'gdb-xml/riscv-64bit-fpu.xml']],
+                             'gdb-xml/riscv-64bit-fpu.xml',
+                             'target/riscv/gdbstub.c']],
                ['mipsel',  ['target/mips/tcg/translate.c',
                             'target/mips/tcg/msa_translate.c',
                             'target/mips/tcg/mxu_translate.c',
@@ -106,6 +108,12 @@ if get_option('plugins')
     # own CORE feature XML.  Same generator, same both-directions refusal;
     # a different registration site because the value-read route goes
     # through qemu_plugin_get_registers(), not through a TCG global.
+    # Since 98f8c621ed the generator also scrapes the register files QEMU
+    # builds in C (GDB_TARGETS csites in scripts/cst-regmap.py: AArch64 SVE
+    # in target/arm/gdbstub64.c, RISC-V vector in target/riscv/gdbstub.c),
+    # so those sources are in the list above beside the XML; with XML alone
+    # an edit to a builder shipped the stale map until something else
+    # forced the regeneration.
     champsim_tracer_regmap_gen += custom_target(
       'champsim_tracer_gdbmap_' + r[0] + '.h',
       output: 'champsim_tracer_gdbmap_' + r[0] + '.h',

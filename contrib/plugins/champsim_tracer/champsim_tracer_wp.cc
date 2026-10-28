@@ -986,6 +986,33 @@ static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
              * Record the terminal-branch taken edge for NON-indirect
              * branches found on the wrong path (see the pre-splitter
              * comment).
+             *
+             * THE TAKEN EDGE IS QEMU'S, NOT AN ARITHMETIC OVER THE ENCODING.
+             * A direct branch's taken target is the value its translator
+             * handed to gen_goto_tb, recorded through
+             * plugin_gen_record_branch_target() and carried on
+             * InsnFields::taken_target_pc -- that plumbing exists precisely
+             * so the direction a walk did NOT run is known.  This read used
+             * to be `lf->immediate` for a conditional that fell through,
+             * and QEMU states the immediate the ENCODING carries: for a
+             * relative branch that is the offset, so an x86_64 `je` with
+             * rel32 0x1cd published `targets: 0x1cd` on every WP-only
+             * template (621 of them in one /bin/true trace).  The alternate
+             * minter and the correct path's resolve_wrong_target() already
+             * read the recorded target; this was the last reader of the raw
+             * immediate.
+             *
+             * AND A WALK THAT FELL THROUGH NAMES NO TAKEN EDGE.  The arm
+             * after the immediate's used to store the landing whatever it
+             * was, so a conditional with no recorded target, a block sealed
+             * at a non-branch, or a syscall-class terminator -- each landing
+             * on its own fall-through -- recorded the fall-through as its
+             * "taken" edge.  The fall-through is the one edge a taken edge
+             * is not.  With no recorded target the observed transfer is
+             * the only evidence of a taken edge, and a fall-through landing
+             * is evidence of none: the field stays 0 ("no taken edge
+             * known"), which a later correct-path finalize or the
+             * alternate minter may still fill.
              */
             if (bb_tmpl && bb_tmpl->taken_pc == 0 && !bb_fields.empty()) {
                 const InsnFields *lf = bb_fields.back();
@@ -999,16 +1026,11 @@ static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
                     lf->branch_type == BRANCH_RETURN ||
                     lf->branch_type == BRANCH_INDIRECT_CALL;
                 if (!indirect) {
-                    bool cond = lf->branch_type == BRANCH_COND_DIRECT ||
-                                (lf->branch_type == BRANCH_DIRECT_JUMP &&
-                                 lf->branch_conditional);
-                    uint64_t taken;
-                    if (commit_post_pc != fall_through) {
-                        taken = commit_post_pc;
-                    } else if (cond && lf->has_immediate &&
-                               (uint64_t)lf->immediate != fall_through) {
-                        taken = (uint64_t)lf->immediate;
-                    } else {
+                    uint64_t taken = 0;
+                    if (lf->branch_type != BRANCH_NONE &&
+                        lf->taken_target_pc != 0) {
+                        taken = lf->taken_target_pc;
+                    } else if (commit_post_pc != fall_through) {
                         taken = commit_post_pc;
                     }
                     if (taken != 0) {

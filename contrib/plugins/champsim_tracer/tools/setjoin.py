@@ -61,6 +61,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 import argparse
 import collections
+import io
 import os
 import sys
 
@@ -323,7 +324,10 @@ def join_rulings(isa, s, rulings, out, universe=None):
              ", ".join("%s %d" % (v, n) for v, n in sorted(kinds.items()))
              or "none",
              len(unruled), len(reserved), len(dead)), file=out)
-    for nm, direction, n in unruled[:20]:
+    # EVERY unruled class, whatever --top says: the R13 scorer sums these
+    # lines and refuses a list shorter than the roll-up above, so a cap here
+    # turns a real headline into a refusal.
+    for nm, direction, n in unruled:
         print("      UNRULED %8d  %s %s" % (n, nm, direction), file=out)
     for k in sorted(reserved)[:20]:
         print("      RESERVED    %s %s  (%s) -- the name is in this build's "
@@ -360,7 +364,7 @@ def report(isa, path, top, out, strict=True, rulings=None,
         if not counts:
             continue
         print("   -- %s, most common first:" % label, file=out)
-        for nm, n in counts.most_common(top):
+        for nm, n in counts.most_common(top or None):
             e = wit[nm][0]
             print("      %8d  %-22s  e.g. %s %s" % (n, nm, e[0], e[1]),
                   file=out)
@@ -647,6 +651,34 @@ def ruling_selftest():
             print("  %-58s %s" % (name, "ok" if ok else "FAILED %s" % (got,)))
             bad += 0 if ok else 1
 
+        # EVERY unruled class is printed, and --top 0 prints every LOST
+        # row: the R13 scorer sums the UNRULED lines against the roll-up and
+        # refuses a short list, and the list used to stop at 20 whatever
+        # --top said.  25 planted classes, all unruled.
+        big = os.path.join(d, "gen_big.tsv")
+        with open(big, "w") as f:
+            f.write("#so plugin=aa emulator=bb\n" + SIDES)
+            for i in range(25):
+                f.write("q\t%02x\tq\tr\t1\t1\tREG_GPR0\n" % (0x10 + i))
+                f.write("q\t%02x\tc\tr\t2\t2\tREG_GPR0,REG_VEC%d\n"
+                        % (0x10 + i, i))
+        rp = os.path.join(d, "r_big.tsv")
+        with open(rp, "w") as f:
+            f.write("# planted\n" + "\t".join(FL) + "\n")
+        buf = io.StringIO()
+        try:
+            st = report("q", big, 0, buf, rulings=read_rulings(rp))
+            text = buf.getvalue().splitlines()
+            got = (len(st["unruled"]),
+                   sum(1 for l in text if l.lstrip().startswith("UNRULED ")),
+                   sum(1 for l in text if "  e.g. " in l))
+        except Refusal as e:
+            got = "REFUSED %s" % e
+        name = "--top 0: all 25 UNRULED and all 25 LOST lines print"
+        ok = got == (25, 25, 25)
+        print("  %-58s %s" % (name, "ok" if ok else "FAILED %s" % (got,)))
+        bad += 0 if ok else 1
+
         # and the vocabulary reader itself must refuse rather than return a
         # short set that would mark live rulings DEAD
         vp = os.path.join(d, "tiny.h")
@@ -683,8 +715,8 @@ def ruling_selftest():
         except Refusal:
             print("  %-58s ok" % "an empty rulings file REFUSES")
 
-    print("setjoin ruling-join selftest: %d of 10 arms fired as designed"
-          % (10 - bad))
+    print("setjoin ruling-join selftest: %d of 11 arms fired as designed"
+          % (11 - bad))
     return 1 if bad else 0
 
 
@@ -695,7 +727,10 @@ def main():
     ap.add_argument("--dir", default=None,
                     help="directory holding gen_<isa>.tsv")
     ap.add_argument("--isa", action="append", default=[])
-    ap.add_argument("--top", type=int, default=15)
+    ap.add_argument("--top", type=int, default=15,
+                    help="how many rows of the LOST/GAIN lists to print; 0 "
+                         "prints every row.  UNRULED classes are always "
+                         "printed in full.")
     ap.add_argument("--require-no-loss", action="store_true",
                     help="fail unless REAL-LOST is 0 on every scored ISA")
     ap.add_argument("--rulings", default=None,

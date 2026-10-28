@@ -329,11 +329,11 @@ def report(isa, ident_path, opc_path, top, out, rulings=None, universe=None):
     if pairs:
         print("   -- disagreements, most common first (each needs a ruling):",
               file=out)
-        for (q, c), n in pairs.most_common(top):
+        for (q, c), n in pairs.most_common(top or None):
             print("      %8d  QEMU %-22s Capstone %s" % (n, q, c), file=out)
     if rules:
         print("   -- rules with no usable word, most common first:", file=out)
-        for r, n in rules.most_common(top):
+        for r, n in rules.most_common(top or None):
             print("      %8d  %s" % (n, r), file=out)
 
     unruled = collections.Counter()
@@ -351,7 +351,7 @@ def report(isa, ident_path, opc_path, top, out, rulings=None, universe=None):
         print("   -- arbitration: %d classes, %d encodings arbitrated "
               "(%d on a coverage path), %d classes UNRULED"
               % (len(classes), arb, cov, len(unruled)), file=out)
-        for key, n in unruled.most_common(top):
+        for key, n in unruled.most_common(top or None):
             print("      UNRULED %8d  rule %-16s QEMU %-22s Capstone %s"
                   % (n, key[1], key[2], key[3]), file=out)
 
@@ -492,6 +492,57 @@ def selftest_rulings():
                 bad += 1
     print("gapreport ruling selftest: %d of %d arms fired as designed"
           % (len(cases) - bad, len(cases)))
+    return 1 if bad else 0
+
+
+def selftest_top():
+    """Prove --top 0 prints EVERY detail line, and a positive --top limits.
+
+    Counter.most_common(0) is an empty list, so passing the option straight
+    through once made --top 0 -- the value REPRODUCE.sh passes to mean "all"
+    -- print no UNRULED line at all, and the R13 scorer, which sums those
+    lines against the roll-up, read a real disagreement as a truncated list.
+    """
+    import io
+    import tempfile
+
+    bad = 0
+    arms = 0
+    with tempfile.TemporaryDirectory() as d:
+        ip = os.path.join(d, "ident_q.tsv")
+        op = os.path.join(d, "opc_q.tsv")
+        rp = os.path.join(d, "rulings.tsv")
+        # Two disagreement classes, neither ruled.
+        with open(ip, "w") as f:
+            f.write(STAMP + "\n#h\n")
+            f.write("q\t01\tadd\tadd\tint.add\tGEN_OP_INT_ADD\t"
+                    "BRANCH_NONE\n")
+            f.write("q\t02\tsub\tsub\tint.sub\tGEN_OP_INT_SUB\t"
+                    "BRANCH_NONE\n")
+        with open(op, "w") as f:
+            f.write(STAMP + "\n#h\nq\t01\tadd\tGEN_OP_INT_MUL\n"
+                    "q\t02\tsub\tGEN_OP_INT_DIV\n")
+        with open(rp, "w") as f:
+            f.write(RULING_ROW + "\n")
+        for top, want in ((0, 2), (1, 1), (5, 2)):
+            arms += 1
+            buf = io.StringIO()
+            got = None
+            try:
+                _c, _cl, unruled, _st = report("q", ip, op, top, buf,
+                                               read_rulings(rp))
+                lines = [l for l in buf.getvalue().splitlines()
+                         if l.lstrip().startswith("UNRULED ")]
+                got = (len(unruled), len(lines))
+            except Refusal:
+                got = "REFUSED"
+            ok = got == (2, want)
+            print("  top:%-3d UNRULED lines %s" % (top, "ok" if ok else
+                                                   "FAILED (%s)" % (got,)))
+            if not ok:
+                bad += 1
+    print("gapreport --top selftest: %d of %d arms fired as designed"
+          % (arms - bad, arms))
     return 1 if bad else 0
 
 
@@ -667,7 +718,9 @@ def main():
     ap.add_argument("--isa", action="append", default=[],
                     help="ISA to score; repeat for several")
     ap.add_argument("--top", type=int, default=10,
-                    help="how many rows of each detail list to print")
+                    help="how many rows of each detail list to print; 0 "
+                         "prints every row (Counter.most_common(0) is an "
+                         "empty list, so 0 is mapped to no limit)")
     ap.add_argument("--require-zero", action="append", default=[],
                     metavar="BUCKET",
                     help="fail unless this bucket is 0 on every ISA")
@@ -684,7 +737,7 @@ def main():
 
     if args.selftest:
         return (selftest() | selftest_rulings() | selftest_universe()
-                | selftest_noword())
+                | selftest_noword() | selftest_top())
 
     if not args.dir or not args.isa:
         print("gapreport: --dir and at least one --isa are required",

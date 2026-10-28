@@ -113,9 +113,11 @@ SEG_TRG = ("mov %ss, %bx", "mov %bx, %ss")
 #: as many iterations as it took to break.
 #:
 #: The ECX == 1 cases are the interesting ones for the lever: with can_loop
-#: false the single generated iteration IS the whole instruction, so QEMU
-#: retires the REP and then re-enters it once more -- the trailing pass -- with
-#: no trap or signal anywhere in the guest.
+#: false the single generated iteration IS the whole instruction.  QEMU used to
+#: retire it and then re-enter it once more -- the trailing pass -- and the
+#: entry for that iteration published the pre-trailing-pass state (EIP on the
+#: REP, EFLAGS.RF set); it now leaves past the REP like the loop does, and the
+#: register-value parity below holds on the final iteration too.
 EXPECT_ITERS = {
     "pc_movsb1":  1,    # rep movsb,  ECX=1
     "pc_stosb1":  1,    # rep stosb,  ECX=1
@@ -496,16 +498,15 @@ class RepFanoutInvarianceTest(unittest.TestCase):
             trg_t, trg_e, trg_s = self._trace(work, trg_bin, "trg", "wp=0")
 
             # The lever must be shown to have engaged before anything is
-            # concluded from the comparison.  Two independent witnesses:
+            # concluded from the comparison.  The witness is
             #
             #  - QEMU's own instruction count.  With can_loop false each
             #    iteration is a separate execution of the instruction, so the
             #    trigger run executes strictly more instructions than the
             #    control for the same guest program.  This witness does not
-            #    depend on the tracer at all.
-            #  - the tracer's trailing-pass counter, which can only be
-            #    non-zero when a REP was re-entered after it had already
-            #    retired -- i.e. exactly when can_loop was false.
+            #    depend on the tracer at all.  (The tracer's trailing-pass
+            #    counter used to be a second witness; QEMU no longer makes
+            #    that pass, which is asserted below.)
             ctl_ic = self._host_icount(ctl_s)
             trg_ic = self._host_icount(trg_s)
             self.assertGreater(
@@ -515,15 +516,15 @@ class RepFanoutInvarianceTest(unittest.TestCase):
                 "this comparison would be a run against itself and proves "
                 "nothing.  Check that MOV to SS still reaches "
                 "DISAS_EOB_INHIBIT_IRQ in target/i386/tcg/translate.c")
-            trailing = self._stat(trg_s, "REP trailing pass dropped")
-            self.assertGreater(
-                trailing, 0,
-                "no REP was seen re-entered after retiring, so can_loop was "
-                "never false and the invariance below is untested")
-            self.assertEqual(
-                self._stat(ctl_s, "REP trailing pass dropped"), 0,
-                "the control run should have no trailing passes: its REPs "
-                "were translated as loops")
+            # A single-iteration translation leaves past the REP on the
+            # iteration that exhausts the counter, as the loop does: there
+            # is no trailing pass to drop in either regime.
+            for tag, st in (("control", ctl_s), ("trigger", trg_s)):
+                self.assertEqual(
+                    self._stat(st, "REP trailing pass dropped"), 0,
+                    f"{tag}: QEMU re-entered a REP after its final iteration "
+                    "-- the trailing pass that published EIP on the REP and "
+                    "RF set as the completed instruction's state")
 
             # No REP may fall back to counting delivered memops on x86.
             for tag, s in (("control", ctl_s), ("trigger", trg_s)):
@@ -589,17 +590,12 @@ class RepFanoutInvarianceTest(unittest.TestCase):
                         "that iteration's entry (maintainer ruling "
                         "2026-10-28); a zero before the last entry is the "
                         "retired last-iteration-only contract.")
-                # Values of iterations 1..N-1: the looping translation's
-                # come from the in-loop capture, the single-iteration
-                # translation's from its live read after each execution.
-                # The final iteration is not compared here: under the
-                # single-iteration translation the completing execution
-                # still re-enters (the trailing pass), so its live read
-                # carries EFLAGS.RF and the REP's own PC rather than the
-                # completed state -- a pre-existing regime artifact of the
-                # END capture, filed separately, not part of this contract.
-                ctl_v = self._reg_values(ctl_t, ctl_e, pc)[:-1]
-                trg_v = self._reg_values(trg_t, trg_e, pc)[:-1]
+                # Values of EVERY iteration, the last included: the
+                # looping translation's come from the in-loop capture and the
+                # END snapshot, the single-iteration translation's from its
+                # live read after each execution.
+                ctl_v = self._reg_values(ctl_t, ctl_e, pc)
+                trg_v = self._reg_values(trg_t, trg_e, pc)
                 self.assertEqual(
                     ctl_v, trg_v,
                     f"{label}: the per-iteration destination VALUES this "

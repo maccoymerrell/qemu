@@ -2042,12 +2042,11 @@ uint32_t qemu_plugin_fault_depth(void);
  * therefore report a different count — and a different trace shape — for
  * identical guest execution.  Reading it here does not.
  *
- * Zero has two meanings, separated by qemu_plugin_rep_complete(): a REP
- * entered with a zero counter (complete, and a real retired instruction),
- * or the trailing pass QEMU makes over an instruction it has already
- * finished when it translated only a single iteration (also complete, but
- * not a new instruction — the caller should recognise it as a continuation
- * of the instruction whose iterations it has already seen).
+ * Zero means a REP entered with a zero counter: complete, and a real
+ * retired instruction.  (A single-iteration translation used to make one
+ * more, trailing, zero-count pass over an instruction it had already
+ * finished; it now leaves past the instruction on its final iteration, but
+ * a consumer recognising such a pass as a continuation stays correct.)
  *
  * Valid for the instruction most recently executed on this vCPU, so read it
  * before running any further guest code (a wrong-path excursion included).

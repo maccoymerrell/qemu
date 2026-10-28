@@ -125,9 +125,14 @@ Plugin API additions
      ``can_loop`` is false whenever ``CF_USE_ICOUNT`` or
      ``CF_SINGLE_STEP`` is set on the block or ``EFLAGS.TF`` or the
      interrupt shadow is live, and QEMU then generates one iteration
-     and jumps back to the instruction's own address — including once
-     after the iteration that exhausted the counter, a pass that does
-     no architectural work.  An iteration count inferred from
+     and jumps back to the instruction's own address.  (Upstream also
+     jumped back after the iteration that exhausted the counter, for a
+     trailing pass that did no architectural work but exposed EIP on
+     the REP and ``EFLAGS.RF`` set after the instruction had completed —
+     to a TF/gdb single-step trap, to ``-icount``, and to a plugin's
+     register reads.  ``do_gen_rep`` now leaves past the REP on that
+     iteration, as the looping translation does, with or without a
+     plugin.)  An iteration count inferred from
      delivered memory-op callbacks inherits all of that, so the fan-out
      would gain an entry, and lose its architectural exit edge, purely
      because of a setting.  Reading the count register instead makes

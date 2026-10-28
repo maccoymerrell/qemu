@@ -1810,6 +1810,23 @@ static void do_gen_rep(DisasContext *s, MemOp ot, TCGv dshift,
         tcg_gen_subi_tl(cx_next, cx_next, 1);
         tcg_gen_brcondi_tl(TCG_COND_TSTNE, cx_next, REP_MAX, loop);
         tcg_gen_brcondi_tl(TCG_COND_TSTEQ, cx_next, cx_mask, last);
+    } else {
+        /*
+         * A single-iteration translation whose iteration just exhausted
+         * the counter has COMPLETED the instruction: leave past it, as the
+         * looping translation's @last does, instead of re-entering it for
+         * a pass that only finds the counter zero and leaves.
+         *
+         * That trailing pass was not architecture.  It surfaced a state no
+         * real machine exposes after the final iteration -- EIP still on
+         * the REP, EFLAGS.RF set -- to everything that observes between
+         * instructions: a single-step (EFLAGS.TF, gdb) trap taken there,
+         * one more instruction under -icount, and a tracer reading the
+         * registers the completed instruction left.  @done clears RF and
+         * advances EIP exactly as the trailing pass would have, one
+         * execution earlier.
+         */
+        tcg_gen_brcondi_tl(TCG_COND_TSTEQ, cx_next, cx_mask, done);
     }
 
     /*

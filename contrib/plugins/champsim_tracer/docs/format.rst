@@ -2535,13 +2535,14 @@ visit:
    before that access would leave.  A single-iteration translation
    (``-icount``) reads each iteration live and publishes the same values
    in the same places, so the register content does not depend on how
-   QEMU translated the instruction.  Under a plugin the looping x86
-   translation carries ``EFLAGS.RF`` through the repetition, as an
-   interrupt between two iterations observes it.  One case still
-   differs: the last iteration of a single-iteration translation (and so
-   of every wrong-path REP) is read before QEMU's trailing re-entry, and
-   publishes ``RF`` set and the REP's own address in ``REG_IP`` where the
-   looping translation publishes the completed state.  An iteration whose state could not
+   QEMU translated the instruction.  Between two iterations the state is
+   the one an interrupt observes there — ``REG_IP`` on the REP and
+   ``EFLAGS.RF`` set, which the looping x86 translation carries through
+   the repetition under a plugin — and after the last iteration it is the
+   completed instruction's — ``REG_IP`` past the REP and ``RF`` clear —
+   in every regime, the wrong path included: a single-iteration
+   translation leaves past the REP on the iteration that exhausts the
+   counter, exactly as the loop does.  An iteration whose state could not
    be read publishes its slots with no width — "no value captured" —
    and is counted (``REP iteration register writes absent`` in the
    stats log).
@@ -2659,8 +2660,7 @@ An execution that faults before moving anything — the first store of
 a ``SET`` landing on a not-yet-mapped destination page — contributes
 no entry: the instruction re-executes after the fault, and that
 re-execution carries the instruction's single rendering.  A demand
-fault therefore does not add an instruction to the trace, exactly as
-an x86 REP's trailing pass does not.
+fault therefore does not add an instruction to the trace.
 
 An execution that moves nothing still executed the instruction and
 still emits exactly one entry, carrying zero memops.  That is routine
@@ -2678,13 +2678,14 @@ count-register decrement, read from QEMU through
 ``qemu_plugin_rep_iterations`` — never a count of delivered memory-op
 callbacks, which varies with how QEMU translated the instruction
 (``-icount``, single-step, ``EFLAGS.TF``, the interrupt shadow, a
-mid-REP exception).  The trailing re-entry a single-iteration
-translation makes after the final iteration contributes no entry.  A
+mid-REP exception).  A single-iteration translation leaves past the
+REP on the iteration that exhausts the counter, so no execution follows
+the final iteration.  A
 REP therefore renders the same entries, edges, memops and
 destination-register writes under every translation, and on the wrong
 path — always single-stepped — as on the correct path.  On the wrong
-path every iteration is its own speculated block and ends with the PC
-back on the REP; for the first iteration of a REP that shares its
+path every iteration is its own speculated block, and every iteration
+but the last ends with the PC back on the REP; for the first iteration of a REP that shares its
 translation block with earlier instructions, that landing is read from
 the latched ``qemu_plugin_rep_*`` facts as "the REP ran", so the
 entering block carries iteration 1 and its memops exactly as on the

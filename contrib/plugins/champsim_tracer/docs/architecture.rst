@@ -1417,7 +1417,7 @@ operation):
         — except when insn ``i`` is a self-looping instruction that
         the latched ``qemu_plugin_rep_*`` facts say retired at least
         one iteration in this ``exec_tb``: a single-stepped REP lands
-        back on its own PC after every iteration, so the REP ran and
+        back on its own PC after every iteration but the last, so the REP ran and
         closes the prefix, carrying its iteration's memops.  (Without
         that reading a REP sharing its TB with earlier instructions
         lost its first wrong-path iteration.)  Append the executed

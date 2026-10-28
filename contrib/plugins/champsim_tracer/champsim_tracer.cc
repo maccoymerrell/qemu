@@ -6936,12 +6936,18 @@ static BranchRecord *observe_branch_transition(BBTemplate *bb_tmpl,
  * terminating branch is the last insn of @bb_tmpl.  Returns 0 when no
  * plausible WP target exists.  Caller holds data_lock.
  *
- * @taken_out receives the TAKEN-edge target, derived from the same
- * observations the resolver uses — never the raw (often PC-relative)
- * immediate.  It is current_pc (where CP transferred) in every case
- * except "CP fell through a resolvable direct conditional", where it
- * is the side CP did NOT run (the same value used for the wrong
- * path).  0 only when the BB has no branch.
+ * @taken_out receives the TAKEN-edge target.  For an indirect/return
+ * terminator it is current_pc, the observed transfer.  For every other
+ * terminator it is, in order: the static target QEMU's translator recorded
+ * for it (InsnFields::taken_target_pc, plugin_gen_record_branch_target() --
+ * never the raw, often PC-relative, immediate); else the observed transfer
+ * when CP did NOT land on the fall-through; else 0, "no taken edge known".
+ * The fall-through is the one edge a taken edge is not: a syscall-class
+ * terminator, which resumes at its own fall-through and records no static
+ * target, used to publish that fall-through as its taken edge.  This is the
+ * wrong path's rule (wp_commit_bb) too, so one template gets one answer
+ * whichever path finalizes it.  The return value (the wrong-path target)
+ * does not depend on @taken_out.
  */
 static uint64_t resolve_wrong_target(const BBTemplate *bb_tmpl,
                                      BranchRecord *br,
@@ -6982,10 +6988,13 @@ static uint64_t resolve_wrong_target(const BBTemplate *bb_tmpl,
         *taken_out = current_pc;
         return BranchHistory::indirect_wrong_target(br, current_pc, prev_ft);
     }
+    /* The taken edge: QEMU's recorded target, else a transfer that was not
+     * the fall-through, else none (see the function comment). */
+    *taken_out = bf->taken_target_pc != 0 ? bf->taken_target_pc
+               : current_pc != prev_ft    ? current_pc
+                                          : 0;
     if (branch_taken) {
-        /* CP took the branch → taken edge = where it went;
-         * WP = the fall-through. */
-        *taken_out = current_pc;
+        /* CP took the branch → WP = the fall-through. */
         return prev_ft;
     }
     if (direct_cond && bf->taken_target_pc != 0 &&
@@ -7001,14 +7010,11 @@ static uint64_t resolve_wrong_target(const BBTemplate *bb_tmpl,
          * accounting, ARM Thumb interworking) is already correctly
          * resolved there.
          */
-        *taken_out = bf->taken_target_pc;
         return bf->taken_target_pc;
     }
     /* Unconditional jump whose sole direction is its fall-through
      * (current_pc == prev_ft, e.g. `jmp .+2`), or an unresolved
-     * terminator: CP still transferred to current_pc — that is the
-     * taken edge.  No distinct wrong path. */
-    *taken_out = current_pc;
+     * terminator: no distinct wrong path. */
     return 0;
 }
 

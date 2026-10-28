@@ -3793,13 +3793,16 @@ what the correct path did: the template header's ``fall_through_pc``
 (the not-taken / next-PC edge) and its ``target_pc`` list (the taken
 edges).  Both are filled even when the correct path never took the
 branch — the wrong-path resolver supplies the edge the correct path
-didn't.  The wrong path takes a direct branch's taken edge from the
-static target QEMU's translator recorded for it
+didn't.  Both paths take a non-indirect terminator's taken edge from
+the static target QEMU's translator recorded for it
 (``plugin_gen_record_branch_target``, the value handed to
 ``gen_goto_tb``) — never from the encoded immediate, which for a
-relative branch is the offset — and a wrong-path walk that landed on
-the fall-through of a terminator with no recorded target records no
-taken edge (``target_pc`` 0) rather than the fall-through.  A
+relative branch is the offset.  A terminator with no recorded target
+takes the observed transfer when that is not its fall-through, and
+otherwise records no taken edge (``target_pc`` 0): a syscall-class
+terminator, which resumes at its own fall-through, publishes 0.  A
+``b .+4``-style jump whose recorded target is its fall-through keeps that
+target.  A
 non-indirect branch has exactly one ``target_pc`` (its
 single taken edge); an indirect/return branch enumerates its
 distinct correct-path-observed targets.  The profile block's

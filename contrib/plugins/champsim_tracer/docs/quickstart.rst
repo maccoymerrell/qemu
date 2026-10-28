@@ -206,7 +206,15 @@ plugin sees its argv.
    defaults to ``100000000`` and must match the granularity used to
    *generate* the simpoint file.  ``warmup`` (default ``0``) traces
    that many insns *before* each simpoint position so cache /
-   branch-predictor warm-up data is captured.  ``simulation``
+   branch-predictor warm-up data is captured.  A simpoint closer to
+   the start of the program than ``warmup`` cannot have that much
+   behind it: its segment opens at instruction 0 and its warm-up is
+   clamped to the simpoint's own position (``warmup=300000`` before a
+   simpoint at instruction 100000 traces 100000 warm-up insns).  The
+   header's ``warmup_insns`` carries the clamped length, and the
+   warm-up/measure boundary (``warmup_end_trace_insn_idx``) is placed
+   at the simpoint, exactly where an unclamped warm-up ends.
+   ``simulation``
    (default ``0`` traces one ``interval`` length) traces that many
    insns *at and after* the simpoint position.  ``warmup`` is only
    meaningful here (you can't warm up before an arbitrary icount or

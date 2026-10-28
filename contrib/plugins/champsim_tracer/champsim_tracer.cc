@@ -3801,6 +3801,14 @@ static const uint64_t CST_FANOUT_HOLD_MAX = 65536;
  * emissions lag execution, and a live read would move the boundary
  * with translation-dependent emission timing. */
 static bool g_seg_warmup_crossed = false;
+/* The open segment's own warmup budget — the value its header carries
+ * (start_trace_segment's `warmup`), which is what the crossing above
+ * measures against.  It differs from the configured warmup_insns only
+ * where the open clamps it: a user-mode simpoint whose position lies
+ * closer to icount 0 than the configured warmup opens at 0 with the
+ * shorter prefix, and its boundary belongs at the simpoint, not past
+ * it. */
+static uint64_t g_seg_warmup_insns = 0;
 /* Records this segment's §2.13 placement has deferred past under the
  * fan-out hold.  Distinguishes, at segment finish, a boundary the hold
  * was still deferring (crossed, sentinel, deferrals > 0 — counted as
@@ -4308,6 +4316,7 @@ static void start_trace_segment(const char *label,
     g_seg_user_prebilled = 0;
     g_seg_warmup_end_trace_insns = UINT64_MAX;
     g_seg_warmup_crossed = false;
+    g_seg_warmup_insns = warmup;
     g_seg_wm_deferred_records = 0;
     /* A fan-out instruction left architecturally in flight by a previous
      * segment must not hold the fresh segment's warmup boundary. */
@@ -7443,14 +7452,16 @@ static void tw_manage_window(unsigned int cpu_index,
      * pinned user clock when marker_user_clock(), the raw inline
      * counter against window_start otherwise.  Runs before this step's
      * seal-phase emissions, so the first record emitted at-or-after the
-     * crossing is capturable by emit_body_entry.  warmup_insns is 0
-     * outside simpoint windows, making the flag true from the first
-     * in-segment step there (boundary index 0 = no warmup, as before). */
+     * crossing is capturable by emit_body_entry.  The budget is the
+     * segment's own (header) warmup, so a clamped simpoint prefix places
+     * its boundary at the simpoint; it is 0 outside simpoint windows,
+     * making the flag true from the first in-segment step there
+     * (boundary index 0 = no warmup). */
     if (g_trace_segments.is_active() && !g_seg_warmup_crossed) {
         bool wm_crossed = marker_user_clock()
-            ? g_user_icount >= warmup_insns
+            ? g_user_icount >= g_seg_warmup_insns
             : icount_prev >=
-                  g_trace_segments.window_start() + warmup_insns;
+                  g_trace_segments.window_start() + g_seg_warmup_insns;
         if (wm_crossed) {
             g_seg_warmup_crossed = true;
         }

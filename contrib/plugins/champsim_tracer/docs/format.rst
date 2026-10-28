@@ -1223,7 +1223,12 @@ segment begins, anchoring the body records to a global instruction
 timeline.  ``warmup_insns`` is the number of instructions at the front
 of the trace meant to prime caches and branch predictors and not be
 evaluated; it is zero outside simpoint mode and on simpoint runs with
-no warmup configured.  ``total_target_insns`` is the configured length
+no warmup configured.  On a user-mode simpoint segment it is the warmup
+the segment actually holds: a simpoint at position *P* with a configured
+warmup *W* > *P* opens at 0 and carries ``warmup_insns = P`` (the
+clamped warmup), and the Step 2.13 boundary is crossed against that
+same value — at the simpoint — never against the configured *W*.
+``total_target_insns`` is the configured length
 of the segment — ``warmup_insns + simulation_insns`` for simpoint
 segments, or ``stop - start`` for non-simpoint runs with an explicit
 stop.  A value of zero means "unbounded" (non-simpoint runs with no

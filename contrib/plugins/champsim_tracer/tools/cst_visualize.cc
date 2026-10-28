@@ -6326,8 +6326,13 @@ static TraceResult process_trace(const char *path, const Options &opts)
                        [&](const cst::BodyWalker::BB &bb) {
                            bb_fn(ctx, bb);
                        });
-        try { body_stream->finalize(); }
-        catch (...) {}
+        /* finalize() reads and verifies the trailing CST_MAGIC.  Its
+         * failure takes the ordinary error path (cst_visualize: <trace>:
+         * <what>, exit 1), as in cst_decode and cst_audit: a body that
+         * ends at a record boundary without its trailing magic is a
+         * truncated trace, and rendering it with exit 0 certified it.
+         * (It used to be swallowed by an empty catch.) */
+        body_stream->finalize();
 
         /* Branch-stream diagnostics dump (per-PC aggregates).  Sorted
          * by total executions descending so the dominant branches
@@ -6517,8 +6522,13 @@ process_trace_multi(const char *path, const Options &opts,
                                specs[i].bb_fn(*ctxs[i], bb);
                            }
                        });
-        try { body_stream->finalize(); }
-        catch (...) {}
+        /* finalize() reads and verifies the trailing CST_MAGIC.  Its
+         * failure takes the ordinary error path (cst_visualize: <trace>:
+         * <what>, exit 1), as in cst_decode and cst_audit: a body that
+         * ends at a record boundary without its trailing magic is a
+         * truncated trace, and rendering it with exit 0 certified it.
+         * (It used to be swallowed by an empty catch.) */
+        body_stream->finalize();
     }
 
     std::vector<MultiResult> out;

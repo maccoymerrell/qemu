@@ -2519,13 +2519,46 @@ def _tripwire_census(work_root: Path) -> dict:
             "unreadable": unparsed, "status": "pass" if ok else "fail"}
 
 
-def run_full(args) -> int:
-    # 24 GiB address-space cap (ulimit -v 25165824 KiB) — children inherit.
+FULL_AS_CAP = 25165824 * 1024     # 24 GiB (ulimit -v 25165824 KiB)
+
+
+def _apply_as_cap(cap: int) -> int:
+    """Put the run under an address-space cap of at most @cap bytes, which
+    every child inherits, and return the soft limit actually in force.
+
+    The cap is a resource guard every spawned run must carry, so failing
+    to install it is fatal.  It used to be set inside ``except: pass``,
+    which ran the whole suite uncapped -- or under whatever limit the
+    caller happened to have -- without a word.  A caller that already
+    imposed a TIGHTER hard limit (an outer ``ulimit -v``) is honoured: the
+    process cannot raise its hard limit, and the tighter cap already does
+    what this one is for, so the soft limit is pinned to it and the fact
+    is printed.  Anything else that leaves the run without a cap of at
+    most @cap is a SystemExit naming the failure."""
+    if not isinstance(cap, int) or cap <= 0:
+        raise SystemExit(f"[full] FATAL: invalid RLIMIT_AS cap {cap!r} -- "
+                         f"refusing to run uncapped")
+    _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    want = cap
+    if hard != resource.RLIM_INFINITY and 0 <= hard < cap:
+        want = hard
+        print(f"[full] RLIMIT_AS: caller's hard limit {hard} B is below the "
+              f"{cap} B cap; running under the caller's limit", flush=True)
     try:
-        cap = 25165824 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
-    except (ValueError, OSError):
-        pass
+        resource.setrlimit(resource.RLIMIT_AS, (want, want))
+    except (ValueError, OverflowError, OSError) as e:
+        raise SystemExit(f"[full] FATAL: cannot install the RLIMIT_AS cap "
+                         f"({want} B): {e} -- refusing to run uncapped")
+    got, _ = resource.getrlimit(resource.RLIMIT_AS)
+    if got == resource.RLIM_INFINITY or got < 0 or got > cap:
+        raise SystemExit(f"[full] FATAL: RLIMIT_AS soft limit is {got} after "
+                         f"setting {want} B -- refusing to run uncapped")
+    return got
+
+
+def run_full(args) -> int:
+    # Address-space cap — children inherit; fatal if it cannot be installed.
+    _apply_as_cap(FULL_AS_CAP)
 
     build_dir = Path(args.build_dir).resolve()
     work_root = Path(args.work_root).resolve()

@@ -1223,13 +1223,17 @@ match each other.
    * - Guest mmap layout
      - ``-R size`` (env ``QEMU_RESERVED_VA``)
      - Pre-allocates a reserved guest-VA window of ``size``
-       bytes and routes every guest ``mmap`` through a
-       deterministic linear walker
-       (``mmap_find_vma_reserved``).  Without it each guest
-       ``mmap`` is forwarded to the host kernel, which applies
-       host ASLR per call — so glibc / vDSO / ld.so end up at
-       different guest addresses each run.  ``-R 8G`` is enough
-       for typical SPEC-class workloads on a 64-bit guest.
+       bytes and places every guest ``mmap`` with a linear
+       walker over QEMU's own page table
+       (``mmap_find_vma_reserved``).  Without it the placement
+       is still QEMU's (``mmap_find_vma``, walking up from the
+       guest's ``TASK_UNMAPPED_BASE`` with a host hint), so the
+       guest layout no longer depends on host mapping order
+       either way; ``-R`` additionally confines the guest to the
+       window.  ``-R 8G`` is enough for typical SPEC-class
+       workloads on a 64-bit guest.  ``qemu-x86_64`` refuses
+       ``-R`` (``Cannot allocate vsyscall page``: the vsyscall
+       page lies above any reservation), so leave it off there.
    * - Host scheduling
      - ``taskset -c 0`` on the QEMU command
      - Pins the QEMU process to one host CPU.  Removes a class
@@ -1327,16 +1331,18 @@ Recommended invocation for maximum reproducibility
 
    $ env -i HOME=/tmp PATH=/usr/bin LANG=C \
      taskset -c 0 setarch -R \
-     qemu-x86_64 -seed 42 -pid 4242 -B 0x40000000 -R 8G \
+     qemu-x86_64 -seed 42 -pid 4242 -B 0x40000000 \
        -plugin ./libchampsim_tracer.so,outfile=run,wp=1,memdata=1,regdata=1,\
                 trace_window=icount:start=0+stop=20000000 \
        ./your_workload
 
-With all seven knobs in place on the same host and same QEMU +
+On ``qemu-aarch64`` / ``qemu-riscv64`` add ``-R 8G``; ``qemu-x86_64``
+refuses it (see the table above).  With all the knobs in place on the
+same host and same QEMU +
 plugin build, and the two runs given the same stdin/stdout, a
 single-vCPU workload that reads no clock is reproducible
 byte-for-byte — the wrong path included.  Drop any of the
-layer-1 knobs (``-seed`` / ``-pid`` / ``-B`` / ``-R``) and the
+layer-1 knobs (``-seed`` / ``-pid`` / ``-B``) and the
 *content* of any windowed segment shifts via the
 pre-segment-icount-drift mechanism — even when the workload
 itself reads no clocks and uses no randomness.

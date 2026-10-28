@@ -910,30 +910,43 @@ static abi_long target_mmap__locked(abi_ulong start, abi_ulong len,
 
     /*
      * For reserved_va, we are in full control of the allocation.
-     * Find a suitable hole and convert to MAP_FIXED.
+     * Validate a MAP_FIXED_NOREPLACE request against the page table.
      */
-    if (reserved_va) {
-        if (flags & MAP_FIXED_NOREPLACE) {
-            /* Validate that the chosen range is empty. */
-            if (!page_check_range_empty(start, start + len - 1)) {
-                errno = EEXIST;
-                return -1;
-            }
-            flags = (flags & ~MAP_FIXED_NOREPLACE) | MAP_FIXED;
-        } else if (!(flags & MAP_FIXED)) {
-            abi_ulong real_start = start & -host_page_size;
-            off_t host_offset = offset & -host_page_size;
-            size_t real_len = len + offset - host_offset;
-            abi_ulong align = MAX(host_page_size, TARGET_PAGE_SIZE);
-
-            start = mmap_find_vma(real_start, real_len, align);
-            if (start == (abi_ulong)-1) {
-                errno = ENOMEM;
-                return -1;
-            }
-            start += offset - host_offset;
-            flags |= MAP_FIXED;
+    if (reserved_va && (flags & MAP_FIXED_NOREPLACE)) {
+        /* Validate that the chosen range is empty. */
+        if (!page_check_range_empty(start, start + len - 1)) {
+            errno = EEXIST;
+            return -1;
         }
+        flags = (flags & ~MAP_FIXED_NOREPLACE) | MAP_FIXED;
+    }
+
+    /*
+     * Place every non-fixed map ourselves and convert it to MAP_FIXED,
+     * with or without reserved_va.  Handing a NULL hint to the host
+     * kernel makes the guest address depend on every host mapping made
+     * before it -- including ones QEMU's own threads make concurrently
+     * (the call_rcu thread's first free() creates a glibc arena at a
+     * scheduler-dependent moment), so the same guest saw its stack, and
+     * every anonymous map, at one of several addresses run to run.
+     * mmap_find_vma walks up from mmap_next_start in the guest's own
+     * unmapped-base window, which QEMU's top-down host maps never reach,
+     * so the placement is a function of the guest's own map sequence,
+     * exactly as reserved_va already makes it for 32-bit guests.
+     */
+    if (!(flags & (MAP_FIXED | MAP_FIXED_NOREPLACE))) {
+        abi_ulong real_start = start & -host_page_size;
+        off_t host_offset = offset & -host_page_size;
+        size_t real_len = len + offset - host_offset;
+        abi_ulong align = MAX(host_page_size, TARGET_PAGE_SIZE);
+
+        start = mmap_find_vma(real_start, real_len, align);
+        if (start == (abi_ulong)-1) {
+            errno = ENOMEM;
+            return -1;
+        }
+        start += offset - host_offset;
+        flags |= MAP_FIXED;
     }
 
     host_prot = target_to_host_prot(target_prot);

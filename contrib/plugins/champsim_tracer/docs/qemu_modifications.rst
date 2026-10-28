@@ -2771,6 +2771,40 @@ run.
    hashed as ``golden_net`` does: 12 distinct with ``-seed`` alone, 12
    distinct with ``-pid`` alone, 1 distinct with both.
 
+``linux-user/mmap.c``
+
+   Every non-fixed guest ``mmap`` is placed by ``mmap_find_vma`` and
+   then performed as ``MAP_FIXED``, with or without ``-R``.  Upstream
+   does that only under ``reserved_va`` — which every 32-bit guest on a
+   64-bit host gets by default — and otherwise passes a NULL hint to
+   the host kernel.  The kernel then puts the map below whatever host
+   mappings already exist, and not all of those are made by the thread
+   doing the ``mmap``: the ``call_rcu`` thread's first ``free()``
+   creates a glibc per-thread arena (a 128 MiB reservation) at a moment
+   the host scheduler picks, racing the main thread's start-up maps.  So
+   on the 64-bit guests the stack ``setup_arg_pages`` maps, and with it
+   the initial ``REG_SP`` in the ``REGFILE`` record, came out at one of
+   two addresses ``0x0C5EF000`` apart from run to run, ``setarch -R``
+   and a pinned environment notwithstanding; ``mipsel`` never moved.
+   ``mmap_find_vma`` walks up from ``mmap_next_start`` in the guest's own
+   ``TASK_UNMAPPED_BASE`` window, which QEMU's top-down host maps do not
+   reach, so a guest address is now a function of the guest's own map
+   sequence alone — the property ``reserved_va`` gives a 32-bit guest.
+   ``-R`` cannot supply it on ``x86_64``: the vsyscall page at
+   ``0xffffffffff600000`` lies outside any reservation and QEMU refuses
+   to start (``Cannot allocate vsyscall page``).
+
+   This is the placement QEMU used for every guest before upstream
+   ``ad87d26e6b`` narrowed it to ``reserved_va``.  The cost is one
+   ``PROT_NONE`` reservation per non-fixed guest map, replaced in place
+   by the real one.
+
+   Measured, ``w1_baseline`` under the ``golden_net`` recipe, one host
+   core shared with a CPU-bound process, 40 runs per arm, both arms
+   concurrently: before, 7/40 (aarch64), 10/40 (riscv64), 7/40 (x86_64)
+   runs at the second address; after, 0/40 on each, the whole legacy
+   decode byte-identical across the 40.
+
 Build wiring
 ------------
 

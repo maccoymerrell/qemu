@@ -470,8 +470,10 @@ plugin change.
        bound (wrong-path memory is discarded, so a bounded set/copy
        is indistinguishable).  Both the constant and the clamp logic
        live in the modified QEMU base at
-       ``target/arm/tcg/helper-a64.c``; the plugin contains no MOPS
-       handling of its own.
+       ``target/arm/tcg/helper-a64.c``.  What the bounded transfer
+       does deliver is rendered per access, exactly as on the correct
+       path (``wp_fan_self_loop``), each access one instruction of the
+       ``wpdepth`` budget.
 
 Trace-content limitations
 -------------------------
@@ -567,27 +569,18 @@ ceiling`` in the statistics summary.
 
 .. _limits-bulk-memory:
 
-**AArch64 bulk-memory instructions can exceed the slot ceiling.**
-The FEAT_MOPS ``SETM`` and ``CPYM`` instructions are the one real class
-that does.  QEMU implements the ``M`` member of each triple as "transfer
-every whole page of the operation", so a single execution moves the
-entire page-aligned body of a ``memset`` or ``memcpy`` — 3840 stores for
-a 64 KiB ``memset``, against 512 addressable slots.  This is intrinsic
-to the architecture, not to the wire: one instruction performs an
-unbounded, register-sized transfer, so no finite slot count can address
-it.  glibc routes ``memcpy`` / ``memmove`` / ``memset`` through these
-instructions on any guest advertising ``HWCAP2_MOPS``, so it is reached
-by ordinary code, not just by microbenchmarks.
-
-What survives the cap: the ``P`` and ``E`` members of each triple are
-architecturally bounded to less than a page each, so their accesses are
-always represented in full, and ``M`` carries the first 512 accesses of
-each direction — the leading, contiguous, 16-byte-strided run of the
-transfer.  The per-template profile is not slot-bound and keeps the
-untruncated ``memops_cp`` total and the full touched address extent, so
-a consumer can see both how much traffic the instruction really did and
-the address range it spanned.  The traffic that is lost is per-entry
-slot detail in the interior of transfers larger than 8 KiB.
+**AArch64 bulk-memory instructions are rendered one access per entry.**
+The FEAT_MOPS ``SETM`` and ``CPYM`` instructions move an unbounded,
+register-sized span in one execution — QEMU implements the ``M`` member
+of each triple as "transfer every whole page of the operation", 3840
+stores for a 64 KiB ``memset`` — and glibc routes ``memcpy`` /
+``memmove`` / ``memset`` through them on any guest advertising
+``HWCAP2_MOPS``.  No slot table could address that on one entry, so
+each reported access is its own entry of the instruction's
+single-instruction self-loop block (format.rst, *Bulk-memory self-loop
+BBs*), the template states one access per direction, and the
+``CST_FID_SLOT_COUNT`` ceiling is never reached.  The cost is entry
+count: a megabyte ``CPYM`` is roughly 65,000 entries.
 
 .. _limits-kernel-strand:
 

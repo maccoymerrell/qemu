@@ -2572,6 +2572,40 @@ count of a MOPS self-loop as a count of memory accesses, not of
 architectural instructions: a single ``CPYM`` covering a megabyte
 appears as roughly 65,000 entries.
 
+The template describes one iteration, for both families, so the
+§4.5 rule — a record's count may be smaller than the template's
+maximum, never larger — holds per entry.  An x86 REP's template
+carries the element's accesses (``rep movsb``: 1 load + 1 store).  A
+MOPS template carries one access row per direction the instruction
+moves, each at most 16 bytes, stated by QEMU at the decode site
+because the step helper performs the transfer behind the op stream:
+a ``SET*`` declares 1 store, a ``CPY*`` / ``CPYF*`` 1 load + 1 store,
+and any one of a copy's entries publishes one of the two.  (Before
+these rows were stated a MOPS template declared no access at all, and
+every entry it published was an impossible-slot memop.)
+
+A MOPS instruction has exactly the shape a REP has: it terminates the
+block that enters it, and it is its own single-instruction self-loop
+block.  Its first access rides the entering block's entry on the
+instruction's (tail) slot; accesses 2..N are entries of the
+single-instruction MOPS block, one entry per iteration of the
+single-instruction self-loop block.  No block ever lists the
+instruction's PC twice, and no template's length depends on the
+transfer size: the count is expressed only by how many times the
+one-instruction block executes.  The unit is one access, not one of
+QEMU's page-sized steps, because a page is 256 sixteen-byte pieces per
+direction — more than the 255 a template can count — and a step's piece
+count moves with each operand's alignment.
+
+The wrong path renders the same per-iteration structure.  An x86 REP
+gets it from QEMU's single-stepped speculation (below).  A MOPS step
+helper loops inside one call, so one speculated execution retires all
+of its accesses; the walker splits them exactly as the correct path
+does — the entering block carries the first, each further access is an
+entry of the single-instruction self-loop block, and every such
+iteration is one instruction of the excursion's ``wpdepth`` budget
+(iterations past it are not published).
+
 How the span divides into accesses is nevertheless **stable**: the
 reported decomposition is the transfer's page-bounded chunking into
 naturally aligned power-of-two pieces of at most 16 bytes, greedy from

@@ -5258,8 +5258,12 @@ void emit_body_entry(BodyStreamState *out_stream,
      * memcpy of a megabyte reaches the wire as ~65K one-memop entries
      * instead of one entry with 65K memops of which 512 survive.
      *
-     * WP entries stay on iter 1: the WP simulator sees the whole
-     * instruction as one architectural branch.
+     * The parent's wrong-path chain stays on iter 1.  The wrong path
+     * renders its own executions of the instruction per iteration too:
+     * an x86 REP because CF_SINGLE_STEP gives every iteration its own
+     * speculated block, a FEAT_MOPS bulk op through wp_fan_self_loop
+     * (champsim_tracer_wp.cc), which applies this same split to the
+     * units one speculated execution retired.
      *
      * Register snapshots fan out per iteration like the memops (#138).
      * A looping translation captures only the instruction's END state,

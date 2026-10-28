@@ -5145,6 +5145,63 @@ static void gen_mops_plugin_pc(DisasContext *s)
  * guest-visible semantics are unchanged; without a plugin nothing
  * changes at all.
  */
+/*
+ * THE ACCESSES ONE ITERATION OF A FEAT_MOPS INSTRUCTION PERFORMS.
+ *
+ * The step helpers move memory with a host memset()/memmove() and report it
+ * themselves (arm_plugin_bulk_mem_cb, the byte-run accumulator behind the
+ * fallbacks, per-byte device reports), so the op stream holds no qemu_ld /
+ * qemu_st for the reader to find, and without this statement the template
+ * says the instruction performs no access at all while every execution
+ * delivers some -- a record's count larger than its template's, which the
+ * wire contract (format.rst section 4.5) forbids.
+ *
+ * The statement is per ITERATION, the same unit gen_mops_plugin_pc() states
+ * for the fan-out and the same shape an x86 REP string operation's template
+ * has: the rows describe one unit of the self-loop, and each executed unit is
+ * published as its own iteration.  A MOPS unit is ONE reported access -- a
+ * naturally aligned piece of at most 16 bytes on RAM (arm_plugin_emit_pieces),
+ * one byte on device memory -- so an iteration performs at most one store,
+ * and for a copy at most one load.  A copy states both rows; any one of its
+ * iterations publishes one of them, a count smaller than the template's and
+ * never larger.  A page-sized step cannot be the unit: one page is 256
+ * pieces per direction, past the 255 a template can count, and its piece
+ * count moves with the alignment of each side.
+ *
+ * The address account is the register the helper computes the address from:
+ * the prologue uses Xd (and Xs) as they stand, the main and epilogue
+ * instructions add the negative size Xn to them (do_setm, do_cpym, ...).
+ * A SET's stored value is Xs's low byte (XZR stores zero and names no
+ * register); a copy's is the loaded byte, which this per-access row cannot
+ * name, so it states no datum.
+ */
+static void a64_note_mops_accesses(int rd, int rs, int rn, bool is_set,
+                                   bool prologue)
+{
+    InsnDataflowHelperAccess row = { .size = 16, .offset = 0, .datum = 0 };
+    InsnDataflowEaPart parts[2];
+    unsigned nparts = prologue ? 1 : 2;
+
+    parts[1] = insn_df_ea(insn_df_reg(regnames[rn]), 0, INSN_DF_EA_EXT_NONE);
+    if (!is_set) {
+        parts[0] = insn_df_ea(insn_df_reg(regnames[rs]), 0,
+                              INSN_DF_EA_EXT_NONE);
+        row.dir = INSN_DF_RD;
+        insn_dataflow_note_helper_accesses(&row, 1, parts, nparts, 0);
+    }
+    parts[0] = insn_df_ea(insn_df_reg(regnames[rd]), 0, INSN_DF_EA_EXT_NONE);
+    row.dir = INSN_DF_WR;
+    if (is_set && rs != 31) {
+        InsnDataflowAtom datum = insn_df_reg(regnames[rs]);
+
+        row.datum = 1;
+        insn_dataflow_note_helper_accesses_datum(&row, 1, parts, nparts, 0,
+                                                 &datum, 1);
+    } else {
+        insn_dataflow_note_helper_accesses(&row, 1, parts, nparts, 0);
+    }
+}
+
 static void gen_mops_plugin_tb_end(DisasContext *s)
 {
 #ifdef CONFIG_PLUGIN
@@ -5214,6 +5271,8 @@ static bool do_SET(DisasContext *s, arg_set *a, bool is_epilogue,
     insn_dataflow_state_write(insn_df_reg(regnames[a->rn]));
     insn_dataflow_state_read(a->rs == 31 ? insn_df_zero()
                                          : insn_df_reg(regnames[a->rs]));
+    a64_note_mops_accesses(a->rd, a->rs, a->rn, true,
+                           fn == gen_helper_setp || fn == gen_helper_setgp);
 
     gen_mops_plugin_pc(s);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(desc));
@@ -5282,6 +5341,8 @@ static bool do_CPY(DisasContext *s, arg_cpy *a, bool is_epilogue, CpyFn fn)
     insn_dataflow_state_write(insn_df_reg(regnames[a->rs]));
     insn_dataflow_state_read(insn_df_reg(regnames[a->rn]));
     insn_dataflow_state_write(insn_df_reg(regnames[a->rn]));
+    a64_note_mops_accesses(a->rd, a->rs, a->rn, false,
+                           fn == gen_helper_cpyp || fn == gen_helper_cpyfp);
 
     gen_mops_plugin_pc(s);
     fn(tcg_env, tcg_constant_i32(syndrome), tcg_constant_i32(wdesc),

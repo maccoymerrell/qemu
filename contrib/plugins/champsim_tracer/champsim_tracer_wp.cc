@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include <algorithm>
 #include <atomic>
 #include <unordered_set>
 #include <utility>
@@ -870,6 +871,155 @@ static void wp_attribute_memops(WpWalkState &st, BBTemplate *cur,
 }
 
 /*
+ * A self-looping instruction that ran several iterations inside ONE
+ * speculated exec_tb, fanned out into one wrong-path block per iteration.
+ *
+ * The correct path renders every iteration of a fan-out instruction as its
+ * own body entry (emit_body_entry's self-loop fan-out): iteration 1 on the
+ * block that entered the loop, iterations 2..N on the instruction's 1-insn
+ * self-loop sub-template, each carrying its own unit of memops.  The wrong
+ * path gets that shape for an x86 REP without doing anything, because
+ * CF_SINGLE_STEP makes every REP iteration its own speculated exec_tb and so
+ * its own block.  A FEAT_MOPS bulk op has no such lever: its step helper
+ * loops inside one TCG call, so one exec_tb runs every unit of it, and the
+ * block used to publish all of them on the one instruction -- a count the
+ * instruction's per-iteration template cannot describe, and a shape the
+ * correct path never produces for the same execution.
+ *
+ * This is the correct path's fan-out, applied where the wrong path needs
+ * it: the latched architectural facts (qemu_plugin_rep_*) name the
+ * instruction and say how many units it retired; the block keeps the
+ * other instructions' memops plus the first unit, and each further unit
+ * becomes a 1-insn block on the sub-template.  Iterations 1..N-1 loop back
+ * to the instruction, the last one leaves on the block's own successor.
+ * Registers follow the correct path's #174 contract: the instruction's
+ * destination writes ride the LAST iteration only.  Each extra iteration is
+ * one simulated instruction of the excursion, exactly as each single-step
+ * REP iteration is, so the fan stops at the wpdepth budget: iterations past
+ * it are not published (their memops with them), and counted.
+ *
+ * A REP never reaches the split (its wrong-path executions retire at most
+ * one iteration each), so x86 wrong-path output is unchanged.
+ */
+static void wp_fan_self_loop(WpWalkState &st, BBTemplate *bb_tmpl,
+                             WPBBEntry &parent, std::vector<WPBBEntry> &subs)
+{
+    if (!bb_tmpl || bb_tmpl->n_insns == 0 ||
+        parent.n_insns_executed != bb_tmpl->n_insns) {
+        return;
+    }
+    /* A block the wpdepth cut ends before its terminator: the instruction
+     * started inside the budget only if the cut range reaches it, which
+     * it never does (the cut range is [0, room) with room < n), so every
+     * unit past the first is past the budget.  The block keeps the first
+     * unit -- the same single iteration a single-stepped REP's cut block
+     * carries -- and the rest are dropped and counted. */
+    bool parent_cut = parent.n_insns_attributed < parent.n_insns_executed;
+    uint32_t last = bb_tmpl->n_insns - 1;
+    const InsnFields *lf = &bb_tmpl->insn_fields[last];
+    size_t mpi = lf->rep_memops_per_iter;
+    const RepArchFacts &wf = rep_state(g_wp_state.saved_cpu_index).wp_facts;
+    if (mpi == 0 || wf.pc == 0 || wf.pc != bb_tmpl->insn_pcs[last] ||
+        wf.iters <= 1) {
+        return;
+    }
+    g_mutex_lock(&data_lock);
+    BBTemplate *sub = g_template_store.self_loop_subtemplate(bb_tmpl);
+    g_mutex_unlock(&data_lock);
+    if (!sub) {
+        return;
+    }
+
+    std::vector<DynParam> rep_dps;
+    std::vector<DynParam> other_dps;
+    for (const DynParam &dp : parent.dyn_params) {
+        (dp.insn_index == last ? rep_dps : other_dps).push_back(dp);
+    }
+    size_t n_iter = (size_t)wf.iters;
+    size_t n_sub = n_iter - 1;
+    uint64_t depth = (uint64_t)max_wrong_path_depth;
+    uint64_t room = parent_cut ? 0
+                  : st.sim_insns < depth ? depth - st.sim_insns : 0;
+    if (n_sub > room) {
+        /* A cut fan never reaches the final iteration, so the
+         * instruction's result is not published either: the iteration
+         * that produced it is past the budget, like every access past it. */
+        g_stats.wp_self_loop_budget_cut_iters += n_sub - room;
+        n_sub = (size_t)room;
+    }
+    st.sim_insns += n_sub;
+    g_stats.wp_self_loop_fanout_iters += n_sub;
+
+    auto slice = [&](size_t k, size_t &lo, size_t &hi) {
+        lo = std::min(k * mpi, rep_dps.size());
+        hi = std::min(lo + mpi, rep_dps.size());
+    };
+
+    unsigned n_dst = lf->n_dst_regs;
+    RegSnap end_snaps[MAX_DST_REGS];
+    bool regs = n_dst > 0 && n_dst <= MAX_DST_REGS &&
+                parent.reg_snaps.size() >= n_dst;
+    if (regs) {
+        RegSnap *tail = parent.reg_snaps.data() +
+                        (parent.reg_snaps.size() - n_dst);
+        for (unsigned d = 0; d < n_dst; d++) {
+            end_snaps[d] = tail[d];
+            cst_wide_zero(&tail[d].value);
+            tail[d].width_bytes = 0;
+        }
+    }
+
+    uint64_t exit_pc   = parent.branch_successor_pc;
+    bool     exit_known = parent.branch_successor_known;
+    uint64_t loop_pc   = sub->start_pc;
+
+    size_t lo, hi;
+    slice(0, lo, hi);
+    parent.dyn_params = std::move(other_dps);
+    parent.dyn_params.insert(parent.dyn_params.end(),
+                             rep_dps.begin() + lo, rep_dps.begin() + hi);
+    if (!parent_cut) {
+        parent.branch_successor_pc    = loop_pc;
+        parent.branch_successor_known = true;
+    }
+
+    subs.reserve(n_sub);
+    for (size_t k = 1; k <= n_sub; k++) {
+        WPBBEntry e;
+        e.template_id = sub->template_id;
+        e.start_pc = sub->start_pc;
+        slice(k, lo, hi);
+        e.dyn_params.reserve(hi - lo);
+        for (size_t j = lo; j < hi; j++) {
+            DynParam dp = rep_dps[j];
+            dp.insn_index = 0;
+            e.dyn_params.push_back(dp);
+        }
+        e.n_insns_executed = 1;
+        e.n_insns_attributed = 1;
+        e.fault = false;
+        e.translation_unavailable = false;
+        e.fault_insn_index = 0;
+        e.tmpl = sub;
+        bool final_iter = (k == n_iter - 1);
+        if (regs) {
+            e.reg_snaps.assign(n_dst, RegSnap{});
+            for (unsigned d = 0; d < n_dst; d++) {
+                if (final_iter) {
+                    e.reg_snaps[d] = end_snaps[d];
+                } else {
+                    cst_wide_zero(&e.reg_snaps[d].value);
+                    e.reg_snaps[d].width_bytes = 0;
+                }
+            }
+        }
+        e.branch_successor_pc    = final_iter ? exit_pc : loop_pc;
+        e.branch_successor_known = final_iter ? exit_known : true;
+        subs.push_back(std::move(e));
+    }
+}
+
+/*
  * Seal a completed true BB discovered on the wrong path: pick its landing
  * PC, compute the architectural fall-through, commit it into the shared
  * template cache (seeding is_system from its VA class), record the
@@ -1134,7 +1284,12 @@ static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
                         g_stats.wp_budget_cut_insns += cut_off;
                     }
                 }
+                std::vector<WPBBEntry> fan;
+                wp_fan_self_loop(st, bb_tmpl, wp_entry, fan);
                 wp_chain.push_back(std::move(wp_entry));
+                for (WPBBEntry &e : fan) {
+                    wp_chain.push_back(std::move(e));
+                }
             }
 
             /*

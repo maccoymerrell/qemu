@@ -542,6 +542,15 @@ public:
      * caller holds data_lock. */
     void promote(BBTemplate *head);
 
+    /* The 1-insn self-loop sub-template of @tb's fan-out terminator
+     * (ensure_rep_subtmpl, built on demand in this segment), or nullptr
+     * when @tb does not end in a fan-out instruction.  The wrong path's
+     * per-iteration fan (wp_fan_self_loop) reaches it through here: its
+     * blocks are committed by commit_true_bb_refs, which -- unlike the
+     * chain-finalize path -- never materializes it.  Caller holds
+     * data_lock. */
+    BBTemplate *self_loop_subtemplate(BBTemplate *tb);
+
 private:
     /* Materialize @tb's REP self-loop sub-template lazily on first
      * demand from the chain-finalize path.  No-op when @tb's

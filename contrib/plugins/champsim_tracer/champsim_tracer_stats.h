@@ -1037,6 +1037,16 @@ struct Stats {
     uint64_t rep_trailing_pass_dropped = 0;
     uint64_t rep_exit_edge_recovered = 0;
     uint64_t rep_reg_writes_deferred = 0;
+    /* wp_self_loop_fanout_iters — wrong-path iterations 2..N of a
+     *   self-looping instruction that retired several units inside ONE
+     *   speculated exec_tb (an AArch64 FEAT_MOPS bulk op; an x86 REP is
+     *   single-stepped there and never does), each published as its own
+     *   1-insn wrong-path block, the shape the correct path's fan-out gives
+     *   the same execution (wp_fan_self_loop).
+     * wp_self_loop_budget_cut_iters — such iterations that fell past the
+     *   excursion's wpdepth budget and were not published. */
+    uint64_t wp_self_loop_fanout_iters = 0;
+    uint64_t wp_self_loop_budget_cut_iters = 0;
     /* rep_piece_table_degenerate — a fault-split REP emission arrived with a
      * per-piece prefix table it could not use, so the emission fell back to
      * the total-based split rather than mis-place slices.

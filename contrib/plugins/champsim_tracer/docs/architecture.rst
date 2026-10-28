@@ -2532,15 +2532,32 @@ way each iteration's memops attach to that iteration's own body entry,
 so the slotted families ``CST_FID_LOAD_ADDR*`` /
 ``CST_FID_STORE_ADDR*`` stay at the low end of their 0..511 range
 however much memory the instruction moves, and the writer-side clamp is
-left as a backstop that nothing currently reaches.
+left as a backstop that nothing currently reaches.  The template
+describes one iteration too: a REP's accesses come from its op stream,
+and a MOPS instruction's — which its step helper performs behind the
+op stream — are stated at the decode site (``a64_note_mops_accesses``
+in ``target/arm/tcg/translate-a64.c``: one store row, plus one load
+row for a copy, each at most 16 bytes), so no entry carries more
+memops than its template's maximum.
 
-The splitter is what makes this work at the BB layer: neither QEMU's
-x86 nor its AArch64 translator ends a TB at these instructions, so the
-fragment splitter cuts the TB at each one.  A glibc ``memcpy`` on a
-FEAT_MOPS guest is a prologue/main/epilogue triple in a single TB and
-becomes three consecutive entries, all of whose memops arrive in one
-buffer — which is why the recorder's straggler carry is bounded by
-emission progress rather than by a fixed number of drains (see
+The wrong path renders the same structure.  A speculated REP is
+single-stepped, so each iteration arrives as its own block; a MOPS
+step helper retires its whole (clamped) transfer inside one speculated
+``exec_tb``, and ``wp_fan_self_loop`` (``champsim_tracer_wp.cc``) splits
+that block the way the correct path's fan-out does — the entering
+block keeps the first access, each further access becomes a 1-insn
+block on the self-loop sub-template, and each counts one instruction
+against ``wpdepth``.
+
+The splitter is what makes this work at the BB layer: the fragment
+splitter seals a true BB at every self-looping instruction, whatever
+the TB boundaries.  Under a plugin QEMU also ends the TB after each
+one — x86's REP translation always has, and the AArch64 translator
+does after a FEAT_MOPS instruction (``gen_mops_plugin_tb_end``) — so a
+glibc ``memcpy`` on a FEAT_MOPS guest, a prologue/main/epilogue
+triple, executes as three TBs and becomes three consecutive fan-outs.
+The recorder's straggler carry is still bounded by emission progress
+rather than by a fixed number of drains (see
 ``drain_cp_into_dyn_params``).
 
 ``MemAccessRecorder::record`` caps per-instruction memops at

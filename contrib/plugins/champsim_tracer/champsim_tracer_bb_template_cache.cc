@@ -1807,6 +1807,15 @@ void TemplateStore::ensure_rep_subtmpl(BBTemplate *tb)
     }
 }
 
+BBTemplate *TemplateStore::self_loop_subtemplate(BBTemplate *tb)
+{
+    if (!tb) {
+        return nullptr;
+    }
+    ensure_rep_subtmpl(tb);
+    return seg_deref(tb->rep_subtmpl);
+}
+
 void TemplateStore::mem_stats(FILE *out) const
 {
     /* Footprint estimator matching the allocations in create_tb_template /

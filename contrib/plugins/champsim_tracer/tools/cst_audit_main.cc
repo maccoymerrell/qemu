@@ -1530,7 +1530,8 @@ int main(int argc, char **argv)
             if (bimodal.excluded_templates() > 0) {
                 std::printf("  %s template(s) untracked: every memop-capable "
                             "insn they carry has an architecturally-optional "
-                            "access (AArch64 FEAT_MOPS, RISC-V SC)\n",
+                            "access (x86 REP string op, AArch64 FEAT_MOPS, "
+                            "RISC-V SC)\n",
                             fmt_n(bimodal.excluded_templates()).c_str());
             }
             if (findings.empty()) {

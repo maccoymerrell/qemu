@@ -1112,8 +1112,19 @@ SYS_USER_MAX_BY_ISA = {
     "riscv64": 0x0001000000000000,
     "mipsel":  0x80000000,
 }
-_BB_RE = re.compile(r'^(BB\d+)\s+(0x[0-9a-fA-F]+)\s+\(insns=(\d+)\s+'
-                    r'fall_through=(0x[0-9a-fA-F]+)\)')
+# The template dump's block header.  cst_decode prints an optional
+# " <symbol>" after the start pc and a " system" flag inside the parentheses
+# when the block's first instruction ran privileged (7c92199b81).  This
+# pattern used to stop at the closing parenthesis and so missed every kernel
+# header: the kernel block's lines then ran on inside whichever user block
+# preceded it in template-id order, its profile line replaced that user
+# block's exec_cp, and a CP-executed user block followed by a WP-only kernel
+# block left the slice without a trace.  Which user blocks vanished was a
+# function of mint order.  A "BB" line this pattern does not parse is now an
+# error rather than a continuation line.
+_BB_RE = re.compile(r'^(BB\d+)\s+(0x[0-9a-fA-F]+)(?:\s+<[^>]*>)?\s+'
+                    r'\(insns=(\d+)\s+fall_through=(0x[0-9a-fA-F]+)'
+                    r'( system)?\)$')
 _PROFILE_RE = re.compile(r'^\s*profile:\s+exec_cp=(\d+)\s+exec_wp=(\d+)')
 _TARGET_RE = re.compile(r'^\s*target\[\d+\]:\s*pc=(0x[0-9a-fA-F]+)')
 _INSN_RE = re.compile(r'^\s+([0-9a-fA-F]{16}):\s+(.*)$')
@@ -1130,7 +1141,10 @@ def canon_user_slice(build: Path, cst: Path, isa: str = "x86_64") -> str:
     Byte-identical across independent boots (the determinism verdict above)."""
     user_max = SYS_USER_MAX_BY_ISA[isa]
     txt = decode_text(build, cst, "templates")
-    blocks: dict[int, list[str]] = {}
+    # Every CP-executed user block, keyed by start pc AND content: two
+    # templates at one pc (self-modifying code) are two blocks, and a dict
+    # keyed on the pc alone kept whichever came last.
+    blocks: list[tuple[int, list[str]]] = []
     cur = None
     cur_lines: list[str] = []
     cur_user = False
@@ -1138,18 +1152,22 @@ def canon_user_slice(build: Path, cst: Path, isa: str = "x86_64") -> str:
 
     def flush() -> None:
         if cur is not None and cur_user and exec_cp > 0:
-            blocks[cur] = cur_lines
+            blocks.append((cur, cur_lines))
 
     for line in txt.splitlines():
         m = _BB_RE.match(line)
         if m:
             flush()
             cur = int(m.group(2), 16)
-            cur_user = cur < user_max
+            # A privileged block is not user code wherever it sits.
+            cur_user = cur < user_max and not m.group(5)
             exec_cp = 0
             cur_lines = [f"BB {m.group(2)} insns={m.group(3)} "
                          f"fall_through={m.group(4)}"]
             continue
+        if re.match(r'^BB\d+\s', line):
+            raise RuntimeError(f"canon_user_slice: unparsed block header "
+                               f"in {cst}: {line!r}")
         if cur is None or not cur_user:
             continue
         mp = _PROFILE_RE.match(line)
@@ -1167,8 +1185,8 @@ def canon_user_slice(build: Path, cst: Path, isa: str = "x86_64") -> str:
             cur_lines.append(f"  {mi.group(1)}: {body}")
     flush()
     out: list[str] = []
-    for pc in sorted(blocks):
-        out.extend(blocks[pc])
+    for _pc, lines in sorted(blocks, key=lambda b: (b[0], b[1])):
+        out.extend(lines)
     return "\n".join(out) + "\n"
 
 

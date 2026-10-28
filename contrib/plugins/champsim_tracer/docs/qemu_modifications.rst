@@ -685,12 +685,18 @@ for a guest that stops progressing on a build that has them.
    ticks re-enable only when both say so.  No-op in user mode, and
    never re-enables a clock that ``vm_stop`` owns.
 
-``qemu_plugin_vclock_ns`` (``plugins/api.c``)
+``qemu_plugin_vclock_ns`` (``plugins/api-system.c``, ``plugins/api-user.c``)
 
    Read side of the freeze above, so a plugin that excludes its own
    cost from guest time can also observe what it left the guest
-   believing.  The two ratios it supports are the guest realtime
-   factor (guest ns per host ns) and the guest instruction rate per
+   believing.  It lives in the per-mode API files rather than
+   ``plugins/api.c`` because ``api.c`` is compiled once for every
+   emulator, where a ``CONFIG_USER_ONLY`` test is never true, and a
+   user-only build has neither icount state nor a virtual clock to link
+   against.  The user half returns 0, and the user half of
+   ``qemu_plugin_icount_enabled``, which lives beside it, returns
+   false.  The two ratios it supports are the guest realtime factor
+   (guest ns per host ns) and the guest instruction rate per
    guest-second; the second is the denominator of the tick-tax
    relation ``HZ * N_tick / R_g``, whose value at 1 is the
    tick/scheduler storm described above.  The ChampSim Tracer's

@@ -40,7 +40,6 @@
 #include "qemu/plugin.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
-#include "qemu/timer.h"
 #include "tcg/tcg.h"
 #include "accel/tcg/cpu-ops.h"
 #include "hw/core/cpu.h"
@@ -51,7 +50,6 @@
 #include "exec/translator.h"
 #include "exec/tb-flush.h"
 #include "exec/cpu-common.h"
-#include "system/cpu-timers.h"
 #include "disas/disas.h"
 #include "exec/insn-dataflow.h"
 #include "qemu/qemu-plugin-dataflow.h"
@@ -1271,15 +1269,6 @@ bool qemu_plugin_paging_enabled(void)
     return mmu_on;
 }
 
-bool qemu_plugin_icount_enabled(void)
-{
-#ifdef CONFIG_USER_ONLY
-    return false;
-#else
-    return icount_enabled();
-#endif
-}
-
 uint64_t qemu_plugin_get_thread_ptr(void)
 {
     g_assert(current_cpu);
@@ -1529,32 +1518,6 @@ void qemu_plugin_vclock_resume(void)
 {
     g_assert(current_cpu);
     cpu_plugin_vclock_resume(current_cpu);
-}
-
-/*
- * Read side of the same clock the pause above freezes.  A plugin that pauses
- * for its own cost needs to be able to see what the guest was left believing:
- * guest-ns per host-ns is the guest realtime factor, and guest instructions
- * per guest-second is the rate the guest's periodic tick load is charged
- * against.  Read-only, so no BQL and no runstate interaction.
- */
-int64_t qemu_plugin_vclock_ns(void)
-{
-#ifdef CONFIG_USER_ONLY
-    return 0;
-#else
-    if (icount_enabled()) {
-        /*
-         * Under icount the virtual clock IS the instruction counter, and
-         * reading it from a vCPU callback with cpu->running && !can_do_io
-         * aborts ("Bad icount read").  There is also nothing to learn: icount
-         * pins guest time to instructions by construction, so the factor this
-         * call exists to measure is a constant of the configuration.
-         */
-        return 0;
-    }
-    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-#endif
 }
 
 bool qemu_plugin_in_async_int(void)

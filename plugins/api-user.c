@@ -55,3 +55,18 @@ void qemu_plugin_update_ns(const void *handle, int64_t new_time)
 {
     qemu_log_mask(LOG_UNIMP, "user-mode can't control time");
 }
+
+/*
+ * Guest clock queries.  User-mode emulation has no guest clock: the guest
+ * reads host time through its syscalls, and there is no icount to drive.
+ * The system-mode halves are in api-system.c.
+ */
+bool qemu_plugin_icount_enabled(void)
+{
+    return false;
+}
+
+int64_t qemu_plugin_vclock_ns(void)
+{
+    return 0;
+}

@@ -698,6 +698,19 @@ collectively check every one:
    with no diversion signal exits 1.  ``=N`` caps the number of body
    entries walked.  See :doc:`format` §5.6 for the full diversion
    taxonomy and the wire contract this check verifies.
+8. **A strict walk that found nothing is not a pass.**  Under
+   ``--strict``, a trace with no template and no correct-path entry
+   is refused with ``cst_decode: EMPTY TRACE: templates=0
+   cp_entries=0 …`` and exit 1, because a walker that visits no
+   entry cannot find a defect and its zero findings carry no
+   evidence.  The refusal is shared by both walkers ``--strict``
+   governs — the body renderer and ``--verify-branch`` (the
+   ``--strict --verify-branch`` combination is how the acceptance
+   gates invoke the decoder) — and each is keyed on its own walk
+   limit: a walk stopped early by ``--max=N`` or
+   ``--verify-branch=N`` is not refused, since its entry count is
+   not evidence of anything.  Without ``--strict`` an empty trace
+   renders and exits 0.
 
 The recommended validation workflow:
 

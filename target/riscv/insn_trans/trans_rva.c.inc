@@ -68,6 +68,25 @@ static bool gen_sc(DisasContext *ctx, arg_atomic *a, MemOp mop)
     tcg_gen_brcond_tl(TCG_COND_NE, load_res, src1, l1);
 
     /*
+     * THE STORE'S ADDRESS IS rs1, WHICH THE RESERVATION CHECK FOLDS AWAY.
+     *
+     * The access below addresses load_res -- the address the matching LR
+     * reserved -- because the branch above has just proved the two equal.
+     * Right for emulation, wrong for the account: load_res is a reservation
+     * global no architecture names, so sc.w's load and store addresses
+     * resolved to a register the wire cannot spell and published EMPTY
+     * (`laddr0=[] saddr0=[]' beside lr.w's `laddr0=[%gp11]').  The
+     * instruction's address operand is rs1; the equality is what lets QEMU
+     * substitute.  Stated where the fold happens, as aarch64's STXR states
+     * Xn over cpu_exclusive_addr: the binding attaches to the value load_res
+     * holds from here on and dies with the write below that clears the
+     * reservation, so no later instruction in the block inherits it.
+     */
+    insn_dataflow_bind(tcgv_tl_temp(load_res),
+                       a->rs1 == 0 ? insn_df_zero()
+                                   : insn_df_reg(riscv_int_regnames[a->rs1]));
+
+    /*
      * Note that the TCG atomic primitives are SC,
      * so we can ignore AQ/RL along this path.
      */

@@ -2421,7 +2421,11 @@ more specific operation:
   load or tagged store** — MIPS ``LL`` / ``SC``, RISC-V ``LR`` / ``SC``,
   AArch64 ``LDXR`` / ``LDAXR`` / ``STXR`` / ``STLXR`` — classify as
   ``LOAD`` / ``STORE`` with ``MF_ATOMIC``. The monitor is a side effect
-  on hardware state; the data is unmodified.
+  on hardware state; the data is unmodified. The store-conditional's
+  memops are addressed by its base register (``SC``'s ``base``, RISC-V
+  ``SC``'s ``rs1``, AArch64 ``STXR``'s ``Xn``) in every translation
+  regime, although QEMU addresses the access through the reservation
+  it proved equal.
 * **Loads / stores with implicit pointer arithmetic** — x86 string
   ops ``LODS`` / ``STOS`` / ``INS`` / ``OUTS`` advance ``RSI``/``RDI`` by the
   operand size on every iteration, so classify as ``INT_ADD`` even

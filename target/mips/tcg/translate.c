@@ -2595,6 +2595,24 @@ static void gen_st_cond(DisasContext *ctx, int rt, int base, int offset,
     /* compare the address against that of the preceding LL */
     gen_base_offset_addr(ctx, addr, base, offset);
     tcg_gen_brcond_tl(TCG_COND_EQ, addr, cpu_lladdr, l1);
+
+    /*
+     * THE ACCESS'S ADDRESS IS base + offset, WHICH THE CHECK ABOVE FOLDS
+     * AWAY -- WITHOUT CF_PARALLEL TOO.  The nonatomic expansion of the
+     * cmpxchg below is a real qemu_ld/qemu_st pair the reader records, and
+     * both address cpu_lladdr: equal to base + offset on the only arm that
+     * touches memory, and a reservation global no architecture names, so the
+     * pair's address provenance resolved to a register the wire cannot spell
+     * and was published EMPTY -- while the CF_PARALLEL statement above names
+     * [base] for the same encoding.  Stated where the fold happens, as
+     * aarch64's STXR states Xn over cpu_exclusive_addr, so one encoding
+     * publishes one address account in both regimes.  The binding attaches
+     * to the value cpu_lladdr holds from here on and dies with its next
+     * write; under CF_PARALLEL no op addresses it and it binds nothing.
+     */
+    insn_dataflow_bind(tcgv_tl_temp(cpu_lladdr),
+                       base == 0 ? insn_df_zero()
+                                 : insn_df_reg(regnames[base]));
     gen_store_gpr(tcg_constant_tl(0), rt);
     tcg_gen_br(done);
 

@@ -1412,7 +1412,15 @@ operation):
     d.  Walk the fragment list of the just-executed QEMU TB.  For
         each fragment determine ``n_executed_in_cur`` via ``post_pc``
         matching against the fragment's own ``insn_pcs`` (on success)
-        or fault-PC matching (on a fault).  Append the executed
+        or fault-PC matching (on a fault).  A landing PC equal to
+        ``insn_pcs[i]`` (``i >= 1``) ends the prefix before insn ``i``
+        — except when insn ``i`` is a self-looping instruction that
+        the latched ``qemu_plugin_rep_*`` facts say retired at least
+        one iteration in this ``exec_tb``: a single-stepped REP lands
+        back on its own PC after every iteration, so the REP ran and
+        closes the prefix, carrying its iteration's memops.  (Without
+        that reading a REP sharing its TB with earlier instructions
+        lost its first wrong-path iteration.)  Append the executed
         prefix's insns to ``bb_pcs`` / ``bb_fields`` / ``bb_bytes`` /
         ``bb_sizes``, bump per-WP attribution counters, and attribute
         the just-captured memops to insn indexes.

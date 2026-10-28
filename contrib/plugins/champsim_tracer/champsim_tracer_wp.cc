@@ -1555,10 +1555,34 @@ static void wp_walk_fragments(WpWalkState &st)
                  * as a full run (loop-back-to-entry), consistent with
                  * the pre-splitter behavior.  No match means this
                  * fragment ran fully and execution either continued
-                 * into the next fragment or left the TB. */
+                 * into the next fragment or left the TB.
+                 *
+                 * Landing ON a self-looping instruction is the one place
+                 * that reading is wrong.  A REP (or FEAT_MOPS bulk op)
+                 * that retired an iteration and is about to be re-entered
+                 * leaves the PC on its own address — which is how every
+                 * wrong-path REP iteration ends, because CF_SINGLE_STEP
+                 * translates one iteration per exec_tb.  When the REP
+                 * heads its TB that match is insn_pcs[0] and reads as a
+                 * full run; when it shares the TB with earlier
+                 * instructions it is insn_pcs[i], i >= 1, and used to
+                 * read as "insn i did not run", so the REP's first
+                 * iteration was never appended and its memops matched no
+                 * prefix instruction — the wrong path rendered one
+                 * iteration fewer than the correct path does from the
+                 * same counter.  The architectural facts QEMU latched
+                 * for this exec_tb say which it was: if they name this
+                 * instruction and at least one iteration retired, the
+                 * instruction ran and closes the executed prefix. */
+                const RepArchFacts &wf =
+                    rep_state(g_wp_state.saved_cpu_index).wp_facts;
                 for (uint32_t i = 1; i < cur->n_insns; i++) {
                     if (cur->insn_pcs[i] == post_pc_now) {
-                        n_executed_in_cur = i;
+                        bool self_loop_ran =
+                            cur->insn_fields[i].rep_memops_per_iter > 0 &&
+                            wf.pc != 0 && wf.pc == cur->insn_pcs[i] &&
+                            wf.iters >= 1;
+                        n_executed_in_cur = self_loop_ran ? i + 1 : i;
                         stop_after_this = true;
                         break;
                     }

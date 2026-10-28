@@ -2635,7 +2635,13 @@ mid-REP exception).  The trailing re-entry a single-iteration
 translation makes after the final iteration contributes no entry.  A
 REP therefore renders the same entries, edges, memops and
 destination-register writes under every translation, and on the wrong
-path — always single-stepped — as on the correct path.  The register
+path — always single-stepped — as on the correct path.  On the wrong
+path every iteration is its own speculated block and ends with the PC
+back on the REP; for the first iteration of a REP that shares its
+translation block with earlier instructions, that landing is read from
+the latched ``qemu_plugin_rep_*`` facts as "the REP ran", so the
+entering block carries iteration 1 and its memops exactly as on the
+correct path.  The register
 half of that invariance is the rule above: exactly one destination
 write, on the final iteration, whatever the translation.  A zero-count REP is a retired instruction and emits its
 one entry, carrying no memops.

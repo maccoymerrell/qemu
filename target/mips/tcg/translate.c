@@ -2797,10 +2797,21 @@ static void gen_arith_imm(DisasContext *ctx, uint32_t opc,
 static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
                           int rt, int rs, int16_t imm)
 {
-    target_ulong uimm;
+    target_ulong uimm = (uint16_t)imm;
 
-    /* The encoded operand (fact 19) and a destination of $zero (fact 10). */
-    insn_dataflow_note_immediate((uint64_t)(int64_t)imm, INSN_DF_IMM_OPERAND);
+    /*
+     * The encoded operand (fact 19) and a destination of $zero (fact 10).
+     *
+     * THE OPERAND IS ZERO-EXTENDED.  ANDI, ORI and XORI combine rs with
+     * the 16-bit field zero-extended to the register width, and LUI's field
+     * is the 16 bits it places in the upper half -- the sign extension LUI
+     * performs happens at bit 31 of the RESULT, not to the field.  @imm is
+     * the int16_t the dispatcher extracted, and stating it as passed
+     * published `ori $t0,$zero,0xc5f5` with an operand of
+     * 0xffffffffffffc5f5, a value the instruction never combines with
+     * anything.  The value stated is the one the arms below emit with.
+     */
+    insn_dataflow_note_immediate((uint64_t)uimm, INSN_DF_IMM_OPERAND);
     note_zero_reg(rt, INSN_DF_WR);
 
     if (rt == 0) {
@@ -2814,7 +2825,6 @@ static void gen_logic_imm(DisasContext *ctx, uint32_t opc,
         note_gpr_read(rs);
         return;
     }
-    uimm = (uint16_t)imm;
     switch (opc) {
     case OPC_ANDI:
         if (likely(rs != 0)) {

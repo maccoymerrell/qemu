@@ -74,19 +74,31 @@ done
 
 mkdir -p "$ROOT"/{merged,ref,join,universe,logs,gap}
 
+# THE EXIT STATUS CARRIES THE STAGES.  This script used to have no way to
+# fail once its preflight passed: no `set -e`, and its last command a `cat`,
+# so a referee that crashed or a setjoin that refused still ended rc=0 and
+# the verdict lived only in the per-stage `rc=` lines a reader had to find.
+# Each stage's status is printed exactly as before AND recorded here; the
+# script exits 1 at the end when any stage's rc was non-zero, naming them.
+FAILED=()
+stage_rc() {        # stage_rc <label> <rc>: print "<label> rc=<rc>", record
+    echo "$1 rc=$2"
+    [ "$2" -eq 0 ] || FAILED+=("$1 rc=$2")
+}
+
 echo "== merge"
-"$PY" "$ROOT/merge.py" > "$ROOT/logs/MERGE.txt" 2>&1; echo "merge rc=$?"
+"$PY" "$ROOT/merge.py" > "$ROOT/logs/MERGE.txt" 2>&1; stage_rc merge $?
 tail -6 "$ROOT/logs/MERGE.txt"
 
 echo "== referee selftest"
-"${REF[@]}" --selftest > "$ROOT/logs/REF_SELFTEST.txt" 2>&1; echo "selftest rc=$?"
+"${REF[@]}" --selftest > "$ROOT/logs/REF_SELFTEST.txt" 2>&1; stage_rc selftest $?
 tail -2 "$ROOT/logs/REF_SELFTEST.txt"
 
 echo "== referee, one run per ISA"
 for isa in $ISAS; do
     "${REF[@]}" --isa "$isa" --in "$ROOT/merged/ident_$isa.tsv" --out-dir "$ROOT/ref" \
         > "$ROOT/logs/REF_$isa.txt" 2>&1
-    echo "referee $isa rc=$?"
+    stage_rc "referee $isa" $?
 done
 
 echo "== join"
@@ -100,7 +112,7 @@ done
 
 echo "== rule universe"
 "$PY" "$T/rule_universe.py" --build-dir "$CAPBUILD" -o "$ROOT/universe" \
-    > "$ROOT/logs/UNIVERSE.txt" 2>&1; echo "universe rc=$?"
+    > "$ROOT/logs/UNIVERSE.txt" 2>&1; stage_rc universe $?
 tail -3 "$ROOT/logs/UNIVERSE.txt"
 
 echo "== setjoin --require-ruled"
@@ -112,7 +124,7 @@ fi
       --isa riscv64 --isa mipsel --require-ruled --top 0 \
       "${setjoin_rulings[@]}" \
       > "$ROOT/SETJOIN_TIP.txt" 2> "$ROOT/SETJOIN_TIP.err"
-echo "setjoin rc=$?"
+stage_rc setjoin $?
 grep -E "arbitration|read on corpus|^setjoin:" "$ROOT/SETJOIN_TIP.txt"
 cat "$ROOT/SETJOIN_TIP.err"
 
@@ -129,6 +141,12 @@ echo "== gapreport --require-ruled --universe --rulings"
       --rulings "$GAP_RULINGS" \
       --universe "$ROOT/universe" --top 20 \
       > "$ROOT/GAP_TIP.txt" 2> "$ROOT/GAP_TIP.err"
-echo "gapreport rc=$?"
+stage_rc gapreport $?
 grep -E "UNRULED|DEAD|RESERVED|read on corpus|^gapreport:" "$ROOT/GAP_TIP.txt" | head -30
 cat "$ROOT/GAP_TIP.err"
+
+if [ ${#FAILED[@]} -ne 0 ]; then
+    echo "score_referee: FAIL -- ${#FAILED[@]} stage(s) non-zero: ${FAILED[*]}"
+    exit 1
+fi
+echo "score_referee: every stage rc=0"

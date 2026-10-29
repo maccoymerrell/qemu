@@ -78,6 +78,21 @@ static bool gen_cmpxchg64(DisasContext *ctx, arg_atomic *a, MemOp mop)
 
     insn_dataflow_note_property(INSN_DF_P_ATOMIC);
     decode_save_opc(ctx, RISCV_UW2_ALWAYS_STORE_AMO);
+    {
+        /* amocas.d on RV32: datum and comparand are even/odd register pairs. */
+        int srcs[4];
+        unsigned n = 0;
+
+        srcs[n++] = a->rs2;
+        if (a->rs2 != 0) {
+            srcs[n++] = a->rs2 + 1;
+        }
+        srcs[n++] = a->rd;
+        if (a->rd != 0) {
+            srcs[n++] = a->rd + 1;
+        }
+        riscv_note_atomic_rmw(ctx, a->rs1, memop_size(mop), srcs, n, true);
+    }
     tcg_gen_atomic_cmpxchg_i64(dest, src1, dest, src2, ctx->mem_idx, mop);
 
     gen_set_gpr_pair(ctx, a->rd, dest);
@@ -124,6 +139,22 @@ static bool trans_amocas_q(DisasContext *ctx, arg_amocas_q *a)
     tcg_gen_concat_i64_i128(dest, destl, desth);
     insn_dataflow_note_property(INSN_DF_P_ATOMIC);
     decode_save_opc(ctx, RISCV_UW2_ALWAYS_STORE_AMO);
+    {
+        /* amocas.q: a 16-byte RMW whose datum and comparand are the even/odd
+         * register pairs rs2:rs2+1 and rd:rd+1. */
+        int srcs[4];
+        unsigned n = 0;
+
+        srcs[n++] = a->rs2;
+        if (a->rs2 != 0) {
+            srcs[n++] = a->rs2 + 1;
+        }
+        srcs[n++] = a->rd;
+        if (a->rd != 0) {
+            srcs[n++] = a->rd + 1;
+        }
+        riscv_note_atomic_rmw(ctx, a->rs1, 16, srcs, n, true);
+    }
     tcg_gen_atomic_cmpxchg_i128(dest, src1, dest, src2, ctx->mem_idx,
                                 (MO_ALIGN | MO_TEUO));
 

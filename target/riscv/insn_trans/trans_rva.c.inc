@@ -64,6 +64,17 @@ static bool gen_sc(DisasContext *ctx, arg_atomic *a, MemOp mop)
 
     insn_dataflow_note_property(INSN_DF_P_ATOMIC);
     decode_save_opc(ctx, 0);
+    {
+        /*
+         * sc stores rs2 when the reservation holds; the nonatomic cmpxchg
+         * below picks between rs2 and the loaded value (its movcond), so the
+         * loaded value is a source of the stored datum, and rd -- the
+         * success/fail flag -- is a function of the loaded value too.
+         */
+        int srcs[1] = { a->rs2 };
+
+        riscv_note_atomic_rmw(ctx, a->rs1, memop_size(mop), srcs, 1, true);
+    }
     src1 = get_address(ctx, a->rs1, 0);
     tcg_gen_brcond_tl(TCG_COND_NE, load_res, src1, l1);
 

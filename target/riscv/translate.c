@@ -1339,6 +1339,53 @@ static bool gen_unary_per_ol(DisasContext *ctx, arg_r2 *a, DisasExtend ext,
  * the reservation, and an instruction that takes one is not an ordinary load
  * however its ops read.
  */
+
+/*
+ * THE ACCESS, UNDER CF_PARALLEL (fact 13's wire side).
+ *
+ * tcg_gen_atomic_* lowers to an atomic helper call on the CF_PARALLEL route
+ * (tcg/tcg-op-ldst.c): the op stream then carries no qemu_ld/qemu_st, while the
+ * helper delivers a load and a store to plugins.  Without a statement the
+ * template would say the instruction cannot touch memory -- which breaks
+ * format.rst 4.5's rule that a record's memop count never exceeds its
+ * template's -- and, because the first translation of a block mints the
+ * template whichever regime it ran in, one encoding would publish different
+ * shapes in the two regimes.  So the access is stated here, in the order and at
+ * the address the nonatomic expansion performs it: a load then a store of @size
+ * bytes at [rs1], the stored value computed from @srcs (and, when
+ * @stores_loaded, from the loaded value), exactly as do_nonatomic_op /
+ * tcg_gen_nonatomic_cmpxchg build it.  Without CF_PARALLEL that expansion IS
+ * the op stream, a real qemu_ld/qemu_st pair the reader records, and stating it
+ * too would declare every access twice -- the same split MIPS gen_st_cond()
+ * takes on the same flag.  rs1 is the architectural address; sc/amocas fold it
+ * to the reservation global the matching LR set (gen_sc binds load_res to it),
+ * so one encoding publishes one address account in both regimes.
+ */
+static void riscv_note_atomic_rmw(DisasContext *ctx, int rs1, uint32_t size,
+                                  const int *srcs, unsigned nsrcs,
+                                  bool stores_loaded)
+{
+    InsnDataflowEaPart part;
+    InsnDataflowAtom atoms[4];
+    unsigned n;
+
+    if (!(tb_cflags(ctx->base.tb) & CF_PARALLEL)) {
+        return;
+    }
+    part = insn_df_ea(rs1 == 0 ? insn_df_zero()
+                               : insn_df_reg(riscv_int_regnames[rs1]),
+                      0, INSN_DF_EA_EXT_NONE);
+    if (nsrcs > ARRAY_SIZE(atoms)) {
+        nsrcs = ARRAY_SIZE(atoms);
+    }
+    for (n = 0; n < nsrcs; n++) {
+        atoms[n] = srcs[n] == 0 ? insn_df_zero()
+                                : insn_df_reg(riscv_int_regnames[srcs[n]]);
+    }
+    insn_dataflow_note_helper_rmw(size, &part, 1, 0, atoms, nsrcs,
+                                  stores_loaded);
+}
+
 static bool gen_amo(DisasContext *ctx, arg_atomic *a,
                     void(*func)(TCGv, TCGv, TCGv, TCGArg, MemOp),
                     MemOp mop)
@@ -1355,6 +1402,20 @@ static bool gen_amo(DisasContext *ctx, arg_atomic *a,
 
     insn_dataflow_note_property(INSN_DF_P_ATOMIC);
     decode_save_opc(ctx, RISCV_UW2_ALWAYS_STORE_AMO);
+    {
+        /*
+         * amoswap stores rs2 unchanged; every other AMO stores a function of
+         * the loaded value and rs2, so the loaded value is a source of the
+         * store (do_nonatomic_op's `new_val' path).  rd receives the old
+         * loaded value either way, which note_helper_rmw carries to the call
+         * result.
+         */
+        int srcs[1] = { a->rs2 };
+        bool stores_loaded = func != &tcg_gen_atomic_xchg_tl;
+
+        riscv_note_atomic_rmw(ctx, a->rs1, memop_size(mop), srcs, 1,
+                              stores_loaded);
+    }
     src1 = get_address(ctx, a->rs1, 0);
     func(dest, src1, src2, ctx->mem_idx, mop);
 
@@ -1370,6 +1431,17 @@ static bool gen_cmpxchg(DisasContext *ctx, arg_atomic *a, MemOp mop)
 
     insn_dataflow_note_property(INSN_DF_P_ATOMIC);
     decode_save_opc(ctx, RISCV_UW2_ALWAYS_STORE_AMO);
+    {
+        /*
+         * amocas stores rs2 when memory equals the comparand rd, else leaves
+         * memory holding the loaded value: the stored datum is a function of
+         * the loaded value, rs2 and rd (the cmpxchg's movcond), and rd also
+         * receives the old loaded value.
+         */
+        int srcs[2] = { a->rs2, a->rd };
+
+        riscv_note_atomic_rmw(ctx, a->rs1, memop_size(mop), srcs, 2, true);
+    }
     tcg_gen_atomic_cmpxchg_tl(dest, src1, dest, src2, ctx->mem_idx, mop);
 
     gen_set_gpr(ctx, a->rd, dest);

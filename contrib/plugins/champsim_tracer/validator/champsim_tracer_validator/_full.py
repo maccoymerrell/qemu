@@ -170,6 +170,7 @@ FEATURES: dict[str, str] = {
     "behavior:reg_snap_accounting": "the plugin's own dropped-slice completeness invariant for the positional reg-snap capture — CP reg-snap slice dropped == 0, end-marker-close drops included (D4-class completeness oracle; the wire has no record of it, so this is read from the <outfile>.stats.log sidecar, offline via cst_audit --stats-log)",
     "behavior:mips_fragment_split_absence": "split_tb_into_fragments's mid-TB continuation path (a branch-classified insn QEMU's translator keeps decoding past) has no current MIPS instance — the T-family conditional trap was the only one and 5bf597d751 correctly reclassified it to BRANCH_NONE, leaving BRANCH_REP as the path's exerciser (x86 X86RepIterationFanout rep movsq, and the aarch64 FEAT_MOPS bulk copy/set triple); this pins that fact and fails if MIPS regains an un-covered instance",
     "behavior:memop_bimodality": "per-template memop bimodality: a memop-capable template's CP executions overwhelmingly nonzero with a small minority of zero-memop outliers is a completeness loss (D4-class oracle generalised past the segment-final-entry special case; cst_lint.h MemopBimodalityLint + validator.py's mirror, both gating)",
+    "behavior:mips_identity_regs": "a MIPS identity or constant-folded arithmetic/logic form still reads and writes the registers QEMU's lowering elided: move $rX,$rX (addiu/ori/xori $rX,$rX,0 and subu/addu/dsubu $rX,$rX,$zero) lowers to a self-move that emits no op, and and/andi/mul folded to a constant by a $zero operand emits a movi that names no source -- so the recovered op stream was short of a register the machine demonstrably uses, and the decode-site statement (target/mips note_identity_move/note_folded_operands) restores the read, and for the self-moves the write, to the wire",
 }
 
 
@@ -1278,6 +1279,25 @@ def _chk_dc_zva_memops(ctx: Ctx) -> Outcome:
                    f"rc={p.returncode}\n{tail}")
 
 
+def _chk_mips_identity_regs(ctx: Ctx) -> Outcome:
+    t = (Path(__file__).resolve().parent / "tests"
+         / "test_mips_identity_regs.py")
+    if not t.is_file():
+        return Outcome("skip", f"test not found: {t}")
+    env = dict(os.environ, CST_BUILD_DIR=str(ctx.build_dir),
+               BUILD_DIR=str(ctx.build_dir))
+    p = subprocess.run([sys.executable, str(t)], text=True,
+                       capture_output=True, env=env)
+    out = (p.stdout or "") + (p.stderr or "")
+    tail = "\n".join(out.splitlines()[-8:])
+    # A missing mipsel cross toolchain skips the whole class, which unittest
+    # still reports as rc 0.  Surface that as a skip, not a silent pass.
+    if p.returncode == 0 and re.search(r"OK \(skipped=\d+\)", out):
+        return Outcome("skip", tail)
+    return Outcome("pass" if p.returncode == 0 else "fail",
+                   f"rc={p.returncode}\n{tail}")
+
+
 def _chk_string_memops(ctx: Ctx) -> Outcome:
     t = (Path(__file__).resolve().parent / "tests" / "test_string_memops.py")
     if not t.is_file():
@@ -2352,6 +2372,12 @@ def build_checks() -> list:
                    "tiles the DCZID_EL0-sized block it zeroes",
                    ["behavior:dc_zva_visible", "wire:FID_mem_addr",
                     "wire:FID_mem_size"], _chk_dc_zva_memops))
+    C.append(Check("features.mips_identity_regs", "features",
+                   "mipsel identity (move $rX,$rX) and $zero-folded "
+                   "and/andi/mul forms still read and write the registers "
+                   "QEMU's lowering elided",
+                   ["behavior:mips_identity_regs", "wire:FID_lane_masks",
+                    "wire:FID_insn_fields"], _chk_mips_identity_regs))
     C.append(Check("features.string_memops", "features",
                    "x86 REP string ops fan out per iteration with the right "
                    "memop count, and the operand model matches the ISA",

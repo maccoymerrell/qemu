@@ -206,6 +206,15 @@ target_ulong helper_rdhwr_cc(CPUMIPSState *env)
 {
     check_hwrena(env, 2, GETPC());
 #ifdef CONFIG_USER_ONLY
+    /*
+     * RDHWR $2 (CC) is the only guest-reachable cycle/time counter in MIPS
+     * user mode, and it reads CP0_Count, which is written only by the
+     * system-mode CP0 timer (target/mips/system/cp0_timer.c): in linux-user
+     * it keeps its reset value for the life of the vCPU.  So unlike the x86
+     * TSC, aarch64 CNTVCT and riscv rdcycle/rdtime paths, this read is
+     * already host-independent and bit-reproducible and needs no
+     * plugin-gated deterministic tick.
+     */
     return env->CP0_Count;
 #else
     return (int32_t)cpu_mips_get_count(env);

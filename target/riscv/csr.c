@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include "qemu/plugin.h"
 #include "cpu.h"
 #include "tcg/tcg-cpu.h"
 #include "pmu.h"
@@ -1014,9 +1015,26 @@ static RISCVException write_vcsr(CPURISCVState *env, int csrno,
 
 #if defined(CONFIG_USER_ONLY)
 /* User Timers and Counters */
-static target_ulong get_ticks(bool shift)
+
+/*
+ * rdcycle, rdtime, rdinstret and their high halves all read the same
+ * free-running counter in user mode.  Stock linux-user services it from the
+ * host oscillator, which no -seed can pin; while a plugin is loaded, return
+ * the deterministic per-vCPU tick instead so a traced run is reproducible on
+ * both the correct and the wrong path.  An unplugged qemu-user keeps the host
+ * value.
+ */
+static int64_t user_counter_ticks(CPURISCVState *env)
 {
-    int64_t val = cpu_get_host_ticks();
+    if (qemu_plugin_any_loaded()) {
+        return cpu_plugin_user_det_ticks(env_cpu(env));
+    }
+    return cpu_get_host_ticks();
+}
+
+static target_ulong get_ticks(CPURISCVState *env, bool shift)
+{
+    int64_t val = user_counter_ticks(env);
     target_ulong result = shift ? val >> 32 : val;
 
     return result;
@@ -1025,28 +1043,28 @@ static target_ulong get_ticks(bool shift)
 static RISCVException read_time(CPURISCVState *env, int csrno,
                                 target_ulong *val)
 {
-    *val = cpu_get_host_ticks();
+    *val = user_counter_ticks(env);
     return RISCV_EXCP_NONE;
 }
 
 static RISCVException read_timeh(CPURISCVState *env, int csrno,
                                  target_ulong *val)
 {
-    *val = cpu_get_host_ticks() >> 32;
+    *val = user_counter_ticks(env) >> 32;
     return RISCV_EXCP_NONE;
 }
 
 static RISCVException read_hpmcounter(CPURISCVState *env, int csrno,
                                       target_ulong *val)
 {
-    *val = get_ticks(false);
+    *val = get_ticks(env, false);
     return RISCV_EXCP_NONE;
 }
 
 static RISCVException read_hpmcounterh(CPURISCVState *env, int csrno,
                                        target_ulong *val)
 {
-    *val = get_ticks(true);
+    *val = get_ticks(env, true);
     return RISCV_EXCP_NONE;
 }
 

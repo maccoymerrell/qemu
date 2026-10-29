@@ -2632,7 +2632,7 @@ void insn_dataflow_extract(unsigned num_insns)
     const TCGOp *win_to = NULL;
     TCGOp *op;
     int win_lender = -1;
-    unsigned wi = 0, bi = 0, pi = 0;
+    unsigned wi = 0, bi = 0, bci = 0, pi = 0;
     int idx = -1;
 
     if (df == NULL) {
@@ -2703,6 +2703,39 @@ void insn_dataflow_extract(unsigned num_insns)
 
         if (op->opc == INDEX_op_insn_start) {
             idx++;
+            /*
+             * A BINDING IS A STATEMENT ABOUT A VALUE WITHIN ONE INSTRUCTION,
+             * and dies at the instruction's end even when no op rewrites the
+             * bound global.  insn_dataflow_bind() exists precisely because the
+             * ops do not name the value, so a bound reservation global that the
+             * instruction never writes -- MIPS cpu_lladdr, which SC reads but
+             * never stores -- would otherwise carry its base register's bit
+             * into the NEXT instruction's reads of the same global.  A block
+             * with two store-conditionals and no load-linked between them then
+             * published the second SC's store address as [base1, base2].  The
+             * riscv and aarch64 store-conditionals retire their reservation
+             * binding with an in-instruction `movi <reservation>,-1', so among
+             * the store-conditionals only MIPS leaked -- but ANY binding a later
+             * instruction rereads leaks the same way on any target (an aarch64
+             * ADR that binds its PC-relative result to the program counter, for
+             * one, left the following `br' reading that result with a spurious
+             * self-dependency on PC).  This confines every target's bindings.
+             *
+             * Bindings are recorded in non-decreasing instruction order and
+             * every binding of an earlier instruction has already been applied
+             * by the time this boundary is reached, so a cursor that clears the
+             * bit of each binding now in the past bounds its effect to its own
+             * instruction.  A binding the instruction's own op already retired
+             * cleared the whole global's provenance there, so clearing the bit
+             * again is a no-op.
+             */
+            while (bci < df->nbind && df->bind[bci].insn < (unsigned)idx) {
+                if (df->bind[bci].insn < num_insns) {
+                    df_clear_bit(df_prov(df->bind[bci].temp),
+                                 df->bind[bci].bit);
+                }
+                bci++;
+            }
             prev = op;
             continue;
         }

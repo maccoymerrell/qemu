@@ -986,6 +986,23 @@ typedef struct InsnDfHelperDir {
 void insn_dataflow_insn_begin(unsigned idx);
 
 /*
+ * The block's exit sequence is about to be emitted, after @num_insns
+ * instructions.
+ *
+ * Called from translator_loop() immediately before ops->tb_stop().  A
+ * translator can REWIND the instruction it was decoding -- i386's page-
+ * crossing restart (sigsetjmp case 2 in i386_tr_translate_insn) and the
+ * never-split retreat both remove its ops and decrement num_insns -- and the
+ * instruction it opened with insn_dataflow_insn_begin() stays the current one.
+ * Every statement tb_stop() then makes, its INSN_DF_W_EPILOGUE window above
+ * all, is filed under an index the reader discards as rewound, so the exit
+ * sequence's program-counter write fell through to the default attribution
+ * and landed on the last surviving instruction.  This re-points the cursor
+ * at that instruction without touching its record.
+ */
+void insn_dataflow_block_stop(unsigned num_insns);
+
+/*
  * Read the TB currently being translated and leave each instruction's result
  * where the translation's own callbacks can reach it.
  *
@@ -1484,6 +1501,8 @@ const char *insn_dataflow_field_reg(uint32_t off, uint32_t size);
  * not need one: it is reached from plugins/, which is not built either.
  */
 static inline void insn_dataflow_insn_begin(unsigned idx)
+{ }
+static inline void insn_dataflow_block_stop(unsigned num_insns)
 { }
 static inline void insn_dataflow_extract(unsigned num_insns)
 { }

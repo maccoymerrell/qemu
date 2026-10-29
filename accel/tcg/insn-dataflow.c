@@ -2551,6 +2551,21 @@ void insn_dataflow_insn_begin(unsigned idx)
     df->decoding = true;
 }
 
+void insn_dataflow_block_stop(unsigned num_insns)
+{
+    /*
+     * A block longer than INSN_DF_MAX_INSNS stopped recording at
+     * insn_dataflow_insn_begin() and stays stopped.  Otherwise the last
+     * surviving instruction is the current one again -- and recording, which
+     * a rewound instruction at index INSN_DF_MAX_INSNS had switched off.
+     */
+    if (df == NULL || num_insns == 0 || num_insns > INSN_DF_MAX_INSNS) {
+        return;
+    }
+    df->cur = num_insns - 1;
+    df->decoding = true;
+}
+
 /*
  * Fill in the writes whose value had no stated source with the instruction's
  * read set.  Runs after the op walk, which is the first moment that set is

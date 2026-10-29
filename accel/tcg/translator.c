@@ -518,7 +518,15 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
         }
     }
 
-    /* Emit code to exit the TB, as indicated by db->is_jmp.  */
+    /*
+     * Emit code to exit the TB, as indicated by db->is_jmp.  The exit
+     * sequence is the block's, and the dataflow cursor must name the last
+     * instruction that survived a rewind (insn_dataflow_block_stop()) for
+     * tb_stop's epilogue window to be read at all.
+     */
+    if (plugin_enabled) {
+        insn_dataflow_block_stop(db->num_insns);
+    }
     ops->tb_stop(db, cpu);
     /* Never-split extension: bill at most the budget the TB was asked
      * for.  Identical to db->num_insns except when the atomic-sequence

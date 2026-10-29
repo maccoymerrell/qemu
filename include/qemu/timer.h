@@ -1092,4 +1092,19 @@ static inline int64_t cpu_get_host_ticks(void)
 }
 #endif
 
+/*
+ * Deterministic, host-independent replacement for cpu_get_host_ticks() /
+ * cpu_get_clock() on the user-mode guest cycle/time read paths, used WHILE A
+ * PLUGIN IS LOADED (qemu_plugin_any_loaded()).  Returns a per-vCPU counter
+ * (CPUState::plugin_det_ticks) that starts at a fixed value and advances by a
+ * fixed stride on every read: strictly non-decreasing, identical sequence on
+ * every seeded run, and advancing so a TSC-delta spin loop still terminates.
+ * Each ISA's user-mode counter read (x86 cpu_get_tsc, aarch64 CNTVCT_EL0 /
+ * PMCCNTR_EL0, riscv rdcycle/rdtime/rdinstret) calls this under the gate and
+ * keeps its stock host path for an unplugged qemu-user.  The value is a
+ * synthetic measure of guest progress, not wall-clock time; it injects no
+ * event.  Defined in accel/tcg/cpu-exec-common.c.
+ */
+uint64_t cpu_plugin_user_det_ticks(CPUState *cpu);
+
 #endif

@@ -670,6 +670,27 @@ struct CPUState {
      */
     bool plugin_spec_kick_deferred;
 
+    /*
+     * Deterministic, host-independent guest cycle/time tick for user-mode
+     * tracing.  A guest cycle/time counter read in linux-user (x86 RDTSC,
+     * aarch64 CNTVCT_EL0, riscv rdcycle/rdtime/rdinstret) is normally
+     * serviced from the host oscillator (cpu_get_host_ticks / cpu_get_clock),
+     * which no -seed can pin: two otherwise byte-identical seeded runs diverge
+     * at the first speculative or correct-path read whose value reaches a
+     * register a later access dereferences.  While a plugin is loaded
+     * (qemu_plugin_any_loaded(), the same gate the RTC host-clock
+     * transparency uses), those reads advance and return this per-vCPU
+     * counter instead through cpu_plugin_user_det_ticks(), so the trace is a
+     * function of guest progress alone.  Zero-initialised with the rest of
+     * CPUState; strictly non-decreasing for the life of the vCPU.  Declared
+     * unconditionally, outside CONFIG_PLUGIN, for the same reason as
+     * plugin_spec_mode: the target architectural read sites are plain code
+     * and the runtime gate folds to false with plugins disabled.  QEMU owns
+     * and advances it; the plugin never writes it (the exposure is one-way,
+     * QEMU -> trace).
+     */
+    uint64_t plugin_det_ticks;
+
 #ifdef CONFIG_PLUGIN
     CPUPluginState *plugin_state;
 

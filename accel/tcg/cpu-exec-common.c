@@ -21,9 +21,33 @@
 #include "exec/log.h"
 #include "system/tcg.h"
 #include "qemu/plugin.h"
+#include "qemu/timer.h"
 #include "internal-common.h"
 
 bool tcg_allowed;
+
+/*
+ * Deterministic, host-independent user-mode guest cycle/time tick.  See the
+ * declaration in qemu/timer.h and CPUState::plugin_det_ticks in
+ * hw/core/cpu.h.  Each ISA's user-mode counter read calls this under the
+ * qemu_plugin_any_loaded() gate in place of the host oscillator, so a traced
+ * single-vCPU user run -- correct path and wrong path alike -- is bit-for-bit
+ * reproducible instead of carrying the raw host TSC/monotonic clock.
+ *
+ * The value is a pure function of how many times the counter has been read:
+ * a fixed base so it looks like a running counter rather than zero, plus a
+ * fixed stride per read so two consecutive reads always differ (a
+ * TSC-delta busy-wait still sees forward progress and terminates) and the
+ * counter is strictly non-decreasing.  No host state and no wall-clock time
+ * enter it, so two seeded runs whose guest execution matches produce the
+ * same sequence; it is a synthetic progress measure and injects no event
+ * (the read it replaces produced a value, never an interrupt or kick).
+ */
+uint64_t cpu_plugin_user_det_ticks(CPUState *cpu)
+{
+    cpu->plugin_det_ticks += 0x40;
+    return 0x0000205200000000ULL + cpu->plugin_det_ticks;
+}
 
 bool tcg_cflags_has(CPUState *cpu, uint32_t flags)
 {

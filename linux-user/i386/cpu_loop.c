@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu.h"
 #include "qemu/timer.h"
+#include "qemu/plugin.h"
 #include "user-internals.h"
 #include "user/cpu_loop.h"
 #include "signal-common.h"
@@ -30,6 +31,16 @@
 
 uint64_t cpu_get_tsc(CPUX86State *env)
 {
+    /*
+     * RDTSC / RDTSCP (both reach here through helper_rdtsc) read the host
+     * oscillator in stock linux-user, which no -seed can pin.  While a
+     * plugin is loaded, return the deterministic per-vCPU tick instead so a
+     * traced run is reproducible on both the correct and the wrong path;
+     * an unplugged qemu-user keeps the host TSC unchanged.
+     */
+    if (qemu_plugin_any_loaded()) {
+        return cpu_plugin_user_det_ticks(env_cpu(env));
+    }
     return cpu_get_host_ticks();
 }
 

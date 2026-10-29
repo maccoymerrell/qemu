@@ -948,13 +948,29 @@ entropy into the ``.bss`` word glibc uses as its pointer guard.
 Pinning both with ``-pid`` and ``-seed`` took 12 of 12 repeat
 traces to a single hash; without either, 12 of 12 were distinct.
 
-**What is genuinely outside the pin.**  A workload that reads a
-clock, a workload given different file descriptors (an
-``fstat`` of a redirected stdout puts that file's inode into
-guest memory), and a multi-threaded workload whose vCPUs
-interleave differently.  These are properties of the run, not of
+**What is genuinely outside the pin.**  A workload given different
+file descriptors (an ``fstat`` of a redirected stdout puts that
+file's inode into guest memory), and a multi-threaded workload whose
+vCPUs interleave differently.  These are properties of the run, not of
 the tracer, and the tracer records them faithfully; hold them
 still at the harness level when byte-stability is required.
+
+**A guest cycle/time read is *not* outside the pin.**  A user-mode
+guest reading an architectural cycle or time counter once was the
+sharpest hole here: ``qemu-user`` serves those reads from the host
+oscillator, which ``-seed`` cannot reach, and the value propagates on
+both paths — ``RDTSC`` fires on the correct path of an ordinary
+start-up, and a wrong-path excursion can dereference a counter value
+left in a register, turning the host clock into a divergent wrong-path
+load address.  While a plugin is loaded, QEMU now returns a
+deterministic, host-independent per-vCPU tick from these reads instead
+of the host clock: x86 ``RDTSC`` / ``RDTSCP``, aarch64 ``CNTVCT_EL0``
+/ ``CNTVCTSS_EL0`` and ``PMCCNTR_EL0``, and riscv ``rdcycle`` /
+``rdtime`` / ``rdinstret``; MIPS ``RDHWR`` CC is already a user-mode
+reset-constant.  Two seeded runs therefore record the same counter
+values on both paths.  See the deterministic-user-mode-cycle/time-read
+entry in :doc:`qemu_modifications`.  (An unplugged ``qemu-user`` keeps
+the host counter, so this changes no untraced semantics.)
 
 **Diagnostic consequence.**  When a wrong-path A/B comes back
 with a large diff, do not read it as many independent

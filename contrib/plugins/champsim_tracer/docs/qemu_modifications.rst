@@ -663,6 +663,74 @@ async-interrupt window
    tracer's PathBuilder consumes; ``plugin_fault_depth`` remains the
    authoritative live depth.
 
+Deterministic user-mode cycle/time reads
+----------------------------------------
+
+System mode reads every architectural counter from
+``QEMU_CLOCK_VIRTUAL`` and the freeze below keeps that clock
+transparent, so a traced system run's counter reads are already a
+function of guest time.  User mode has no virtual clock: ``qemu-user``
+services a guest cycle/time read from the host oscillator
+(``cpu_get_host_ticks`` / ``cpu_get_clock``), which no ``-seed``
+reaches.  That value lands in a guest register, and when the program
+dereferences it on the correct path — or a wrong-path excursion
+dereferences a counter value left in a callee-saved register — the
+host clock enters the trace and two otherwise byte-identical seeded
+runs diverge.  ``RDTSC`` alone fires several times on the correct path
+of an ordinary ``ld.so`` start-up, so this is a correct-path gap as
+much as a wrong-path one; a wrong-path-only pin would also add a
+fourth way the two paths differ.  While a plugin is loaded, those
+reads return a deterministic per-vCPU tick on **both** paths instead.
+
+   The exposure is one-way and narrow, matching the intended
+   architecture: QEMU owns and advances the tick, the plugin never
+   feeds it.  The gate is ``qemu_plugin_any_loaded()`` — the same
+   predicate the RTC's host-clock transparency uses — so a stock
+   ``qemu-user`` with no plugin keeps the host counter untouched and
+   no untraced semantics change.  The tick is a synthetic measure of
+   guest progress, not wall-clock time, and it injects no event: it
+   replaces the value a counter read returns, never an interrupt, a
+   timer or a kick (the system-mode freeze likewise simply discards
+   the wall-clock interval an excursion consumes).
+
+``CPUState::plugin_det_ticks`` + ``cpu_plugin_user_det_ticks``
+(``accel/tcg/cpu-exec-common.c``)
+
+   The per-vCPU counter and the one function that advances it: a fixed
+   base so it reads like a running counter rather than zero, plus a
+   fixed stride per read.  It is strictly non-decreasing and advances
+   on every read, so a ``TSC``-delta busy-wait still sees forward
+   progress and terminates (a bare constant could wedge such a loop);
+   and because the value is a pure function of the read count, two
+   seeded runs whose guest execution matches produce the same
+   sequence.  The field is declared unconditionally, like
+   ``plugin_spec_mode``, so the architectural read sites compile with
+   plugins disabled, where the runtime gate folds to false.
+
+``cpu_get_tsc`` (``linux-user/i386/cpu_loop.c``)
+
+   x86 ``RDTSC`` / ``RDTSCP`` (both reach here through
+   ``helper_rdtsc``) return the tick under the gate, else the host
+   TSC.
+
+``gt_virt_cnt_read`` and ``cycles_get_count`` (``target/arm/helper.c``)
+
+   aarch64 ``CNTVCT_EL0`` / ``CNTVCTSS_EL0`` (the counters the vDSO
+   reads for a fast ``clock_gettime``) and ``PMCCNTR_EL0`` return the
+   tick under the gate, else the host-clock-derived count.
+
+``user_counter_ticks`` (``target/riscv/csr.c``)
+
+   riscv ``rdcycle`` / ``rdtime`` / ``rdinstret`` and their high
+   halves all read one user-mode counter; it returns the tick under
+   the gate, else the host ticks.
+
+   MIPS needs no change: the only user-reachable counter, ``RDHWR``
+   ``$2`` (CC), reads ``CP0_Count``, which is written only by the
+   system-mode CP0 timer, so in ``qemu-user`` it keeps its
+   reset-constant for the life of the vCPU — already host-independent
+   and reproducible.
+
 Guest-time transparency
 -----------------------
 

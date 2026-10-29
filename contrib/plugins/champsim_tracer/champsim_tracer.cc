@@ -4709,10 +4709,23 @@ static bool smp_succ_excludes(const SmpClaim &p, uint64_t pc)
     switch (t->insn_fields[bi].branch_type) {
     case BRANCH_DIRECT_JUMP:
     case BRANCH_DIRECT_CALL:
-        return t->taken_pc != 0 && pc != t->taken_pc;
     case BRANCH_COND_DIRECT:
-        return t->taken_pc != 0 && t->fall_through_pc != 0 &&
-               pc != t->taken_pc && pc != t->fall_through_pc;
+        if (t->insn_fields[bi].branch_conditional) {
+            /* Both edges are reachable: the taken target QEMU recorded
+             * and the fall-through.  Besides BRANCH_COND_DIRECT this
+             * covers a CONDITIONAL direct call -- MIPS BGEZAL/BLTZAL and
+             * the Release-6 BxxZALC forms link a return address but are
+             * conditional, so a not-taken one falls through and its
+             * successor is the fall-through, NOT the taken edge.  Reading
+             * such a call as unconditional (taken edge only) made a
+             * not-taken one look like a CFG-impossible re-claim and raised
+             * a false "one entry later" report -- the same class
+             * adc7e2537a removed for BGTZ on the emit side (52 AC-42). */
+            return t->taken_pc != 0 && t->fall_through_pc != 0 &&
+                   pc != t->taken_pc && pc != t->fall_through_pc;
+        }
+        /* Unconditional direct transfer: the single taken edge. */
+        return t->taken_pc != 0 && pc != t->taken_pc;
     default:
         return false;              /* indirect / return / syscall / REP */
     }

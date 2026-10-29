@@ -96,9 +96,14 @@ The whole-suite entrypoint is a different subcommand, `full`:
 python -m champsim_tracer_validator full --build-dir <build> -o <out-dir>
 ```
 
-When validating a build dir that is **not** the canonical `build/`, set `CST_DECODE` to that dir's
-`cst_decode`. `_cst_decode_runner.py` otherwise falls back to `../../build/contrib/plugins/cst_decode`
-and decodes the traces with the shared binary, producing false system-tier failures.
+When validating a build dir that is **not** the canonical `build/`, pass that dir's decoder as a
+**flag**: `--cst-decode <build-dir>/contrib/plugins/cst_decode` (landed 6ac5fb2c72; `all` prints the
+`[all] decoder=<path>` line it resolved and refuses a run whose decoder is not the build under
+test's). Do **not** export `CST_DECODE` into the environment for user-mode cells: qemu-user hands the
+harness environment to the guest, and the extra string moves the guest stack and changes the trace
+(measured 2026-10-28, x86_64 w1_baseline body hash moved). Without the flag,
+`_cst_decode_runner.py` falls back to `../../build/contrib/plugins/cst_decode` and decodes the traces
+with the shared binary, producing false system-tier failures.
 
 Do **not** invoke `tests/run_roundtrip.sh` directly. When changing the `--format=legacy` output of `cst_decode`,
 update `validator/champsim_tracer_validator/_cst_decode_runner.py` (it shells out to `cst_decode --format=legacy`

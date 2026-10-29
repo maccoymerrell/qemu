@@ -16,6 +16,7 @@
 #include "exec/page-protection.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
+#include "qemu/plugin.h"
 #include "qemu/bitops.h"
 #include "qemu/qemu-print.h"
 #include "exec/cputlb.h"
@@ -723,6 +724,14 @@ static uint64_t cycles_get_count(CPUARMState *env)
     return muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                    ARM_CPU_FREQ, NANOSECONDS_PER_SECOND);
 #else
+    /*
+     * PMCCNTR_EL0's user-mode count is the host oscillator; while a plugin is
+     * loaded, return the deterministic per-vCPU tick so a traced run is
+     * reproducible.  An unplugged qemu-user keeps the host value.
+     */
+    if (qemu_plugin_any_loaded()) {
+        return cpu_plugin_user_det_ticks(env_cpu(env));
+    }
     return cpu_get_host_ticks();
 #endif
 }
@@ -3528,7 +3537,17 @@ static uint64_t gt_virt_cnt_read(CPUARMState *env, const ARMCPRegInfo *ri)
      * Currently we have no support for QEMUTimer in linux-user so we
      * can't call gt_get_countervalue(env), instead we directly
      * call the lower level functions.
+     *
+     * CNTVCT_EL0 / CNTVCTSS_EL0 are the counters the aarch64 vDSO reads for
+     * a fast clock_gettime, so a program dereferencing their result on the
+     * correct path, or one speculated on the wrong path, otherwise carries
+     * the host clock into the trace.  While a plugin is loaded, return the
+     * deterministic per-vCPU tick instead; an unplugged qemu-user keeps the
+     * host-clock-derived count.
      */
+    if (qemu_plugin_any_loaded()) {
+        return cpu_plugin_user_det_ticks(env_cpu(env));
+    }
     return cpu_get_clock() / gt_cntfrq_period_ns(cpu);
 }
 

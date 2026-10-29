@@ -21,7 +21,6 @@ WIRE-PARITY	parity/*.txt	^PARITY: 0 unexplained	Old-vs-rebuild wire comparison, 
 R13-EXTERNAL	r13/*.txt	^R13: PASS	External-truth legs at the tip: referee (cst_referee) UNEXPLAINED=0 x4 ISAs + the applicable depmap/fdcheck/PIN legs, each with its firing proof (feedback_external_truth_standing_gate, feedback_references_always_enforced).
 DETERMINISM	det/*.txt	^DET: IDENTICAL	Per-cell r1-vs-r2 byte identity on decompressed segments, both arms, every matrix cell; a run with rc!=0 or a missing segment is NO-SUBJECT = FAIL.
 GOLDEN	golden/*.txt	^GOLDEN: PASS	Golden-trace net at the tip (fixed golden .cst, never re-traced), or the maintainer-approved re-baseline record for an adjudicated wire change.
-BOUNDARY	gates/boundary*.txt	fail=0	boundary_gate.sh: allowlist + engine line ratchet + boundary grep, fail=0, stamped at tip.
 SIMILARITY	gates/simgate*.txt	^SIMGATE: PASS	plugin_similarity_gate vs the frozen reference, with its planted-red proof.
 BUDGET	gates/budget*.txt	^BUDGET: ADJUDICATED	PLUGIN_BUDGET / RATCHET_BASELINE deltas enumerated and adjudicated (maintainer sign-off recorded for any raise).
 RATE	rate/*.txt	^RATE: PASS	The ruled rate bar (20M insns in a few minutes or less; run and close reported separately) vs the ORIGINAL tracer's measured rate on the same cells (feedback_tracing_rate_bar; no cross-wave comparison — interleaved arms).

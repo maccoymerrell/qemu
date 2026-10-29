@@ -172,6 +172,7 @@ FEATURES: dict[str, str] = {
     "behavior:memop_bimodality": "per-template memop bimodality: a memop-capable template's CP executions overwhelmingly nonzero with a small minority of zero-memop outliers is a completeness loss (D4-class oracle generalised past the segment-final-entry special case; cst_lint.h MemopBimodalityLint + validator.py's mirror, both gating)",
     "behavior:mips_identity_regs": "a MIPS identity or constant-folded arithmetic/logic form still reads and writes the registers QEMU's lowering elided: move $rX,$rX (addiu/ori/xori $rX,$rX,0 and subu/addu/dsubu $rX,$rX,$zero) lowers to a self-move that emits no op, and and/andi/mul folded to a constant by a $zero operand emits a movi that names no source -- so the recovered op stream was short of a register the machine demonstrably uses, and the decode-site statement (target/mips note_identity_move/note_folded_operands) restores the read, and for the self-moves the write, to the wire",
     "behavior:vec_dup_from_state": "a broadcast that reads a vector element from register state records the element read: INDEX_op_dupm_vec (tcg_gen_gvec_dup_mem on a vector host) is a load of 1<<vece bytes at base+ofs, so df_ldst() counts it and the destination's source list names the register whose element is replicated -- AArch64 NEON DUP (element) and SVE DUP (indexed), alongside the x86 VPBROADCAST/VBROADCAST family that shares the op",
+    "behavior:cycle_read_deterministic": "a user-mode guest cycle/time read is deterministic and host-independent while the tracer is active: x86 RDTSC, aarch64 CNTVCT_EL0 and riscv rdcycle/rdtime return a per-vCPU tick (cpu_plugin_user_det_ticks, gated on qemu_plugin_any_loaded()) in place of the host oscillator, so two seeded runs record the same strictly-advancing values on both the correct and the wrong path instead of the raw host clock; MIPS RDHWR CC is already a user-mode reset-constant and is witnessed as such, and an unplugged qemu-user keeps host-TSC behaviour",
 }
 
 
@@ -1322,6 +1323,30 @@ def _chk_vec_dup_source(ctx: Ctx) -> Outcome:
                    f"rc={p.returncode}\n{tail}")
 
 
+def _chk_cycle_read_determinism(ctx: Ctx) -> Outcome:
+    t = (Path(__file__).resolve().parent / "tests"
+         / "test_cycle_read_determinism.py")
+    if not t.is_file():
+        return Outcome("skip", f"test not found: {t}")
+    env = dict(os.environ, CST_BUILD_DIR=str(ctx.build_dir),
+               BUILD_DIR=str(ctx.build_dir))
+    p = subprocess.run([sys.executable, str(t)], text=True,
+                       capture_output=True, env=env)
+    out = (p.stdout or "") + (p.stderr or "")
+    tail = "\n".join(out.splitlines()[-8:])
+    # Each ISA leg self-skips when its cross toolchain or qemu-<arch> is
+    # absent; the non-vacuity guard always runs.  Report a skip ONLY when
+    # EVERY executing leg skipped -- i.e. the run reduced to the guard alone
+    # -- so a real ISA pass is never laundered into a silent skip.
+    if p.returncode == 0:
+        mr = re.search(r"Ran (\d+) tests?", out)
+        mk = re.search(r"OK \(skipped=(\d+)\)", out)
+        if mr and mk and int(mr.group(1)) - int(mk.group(1)) <= 1:
+            return Outcome("skip", tail)
+    return Outcome("pass" if p.returncode == 0 else "fail",
+                   f"rc={p.returncode}\n{tail}")
+
+
 def _chk_string_memops(ctx: Ctx) -> Outcome:
     t = (Path(__file__).resolve().parent / "tests" / "test_string_memops.py")
     if not t.is_file():
@@ -2408,6 +2433,15 @@ def build_checks() -> list:
                    "replicates -- the destination's source list is non-empty",
                    ["behavior:vec_dup_from_state", "wire:FID_lane_masks"],
                    _chk_vec_dup_source))
+    C.append(Check("features.cycle_read_determinism", "features",
+                   "a user-mode guest cycle/time read (x86 RDTSC, aarch64 "
+                   "CNTVCT_EL0, riscv rdcycle) returns a deterministic, "
+                   "host-independent, strictly-advancing tick while the "
+                   "tracer is active, reproducible across two seeded runs; "
+                   "MIPS RDHWR CC is witnessed as an already-deterministic "
+                   "user-mode constant",
+                   ["behavior:cycle_read_deterministic"],
+                   _chk_cycle_read_determinism))
     C.append(Check("features.string_memops", "features",
                    "x86 REP string ops fan out per iteration with the right "
                    "memop count, and the operand model matches the ISA",

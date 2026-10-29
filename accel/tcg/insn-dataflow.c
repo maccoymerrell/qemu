@@ -908,6 +908,22 @@ static bool df_ldst(const TCGOp *op, bool *store, uint32_t *size)
         *store = false; *size = 8; return true;
     case INDEX_op_ld_vec:
         *store = false; *size = tcg_type_size(TCGOP_TYPE(op)); return true;
+    case INDEX_op_dupm_vec:
+        /*
+         * A BROADCAST FROM STATE IS A LOAD OF ONE ELEMENT.
+         *
+         * tcg_gen_gvec_dup_mem() emits dupm_vec(ret, base, ofs) when the host
+         * has vectors: it reads 1 << vece bytes at base + ofs and replicates
+         * them, and its argument layout is ld_vec's.  Left out of this
+         * switch, the read of the element went unrecorded, so on x86
+         * `vpbroadcastb %xmm0,%ymm0` (c4 e2 7d 78 c0) published a write of
+         * v0 and no source at all, every register-source VPBROADCAST/
+         * VBROADCASTSS/SD alike; aarch64's DUP (element) and SVE's DUP
+         * (indexed) reach the same op.  The memory forms read a scratch
+         * slot their own load just wrote, which the reader already resolves
+         * to that load.
+         */
+        *store = false; *size = 1u << TCGOP_VECE(op); return true;
     case INDEX_op_st8_i32: case INDEX_op_st8_i64:
         *store = true; *size = 1; return true;
     case INDEX_op_st16_i32: case INDEX_op_st16_i64:

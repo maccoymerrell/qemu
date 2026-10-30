@@ -2493,9 +2493,14 @@ static void gen_conditional_jump_labels(DisasContext *s, target_long diff,
     if (not_taken) {
         gen_set_label(not_taken);
     }
+    /* Fall-through arm: QEMU resolved this branch not-taken.  Stamped for
+     * plugins before the goto_tb so a `jcc` to the next instruction (taken
+     * target == fall-through) still publishes its real direction. */
+    translator_plugin_cond_branch(&s->base, (uint64_t)s->base.pc_next, false);
     gen_jmp_rel_csize(s, 0, 1);
 
     gen_set_label(taken);
+    translator_plugin_cond_branch(&s->base, (uint64_t)s->base.pc_next, true);
     gen_jmp_rel(s, s->dflag, diff, 0);
 }
 

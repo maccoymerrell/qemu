@@ -365,10 +365,17 @@ static bool gen_branch(DisasContext *ctx, arg_b *a, TCGCond cond)
     }
 #endif
 
+    /* Fall-through arm: QEMU resolved this branch not-taken.  Stamped for
+     * plugins before the goto_tb so a coincident-edge branch (taken target ==
+     * fall-through) still publishes its real direction. */
+    translator_plugin_cond_branch(&ctx->base,
+                                  (uint64_t)ctx->base.pc_next, false);
     gen_goto_tb(ctx, 1, ctx->cur_insn_len);
     ctx->pc_save = orig_pc_save;
 
     gen_set_label(l); /* branch taken */
+    translator_plugin_cond_branch(&ctx->base,
+                                  (uint64_t)ctx->base.pc_next, true);
 
     if (!riscv_cpu_allow_16bit_insn(ctx->cfg_ptr,
                                     ctx->priv_ver,

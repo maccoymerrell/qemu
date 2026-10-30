@@ -248,6 +248,15 @@ typedef uint64_t qemu_plugin_id_t;
  * - added qemu_plugin_decode_only_nobuf: how many of those translations
  *   were declined because the code buffer was full.
  *
+ * version 25:
+ * - added qemu_plugin_cond_branch_taken / qemu_plugin_cond_branch_pc: the
+ *   resolved runtime direction of the conditional branch a vCPU just ran,
+ *   and the branch that direction describes.  Stamped by the branch's own
+ *   target translation (a constant on each arm), this is the only honest
+ *   source of the direction for a branch whose taken target coincides with
+ *   its fall-through, where every successor-PC inference collapses to
+ *   not-taken whatever the condition resolved.
+ *
  * Where an entry above says a signature changed WITHOUT the version
  * constant moving, the version in force at the time names two
  * incompatible spellings of the same symbol and cannot be honoured
@@ -259,7 +268,7 @@ typedef uint64_t qemu_plugin_id_t;
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 24
+#define QEMU_PLUGIN_VERSION 25
 
 /*
  * The two values a signed vCPU index takes when it is not an index.
@@ -2152,6 +2161,51 @@ uint64_t qemu_plugin_rep_bytes(void);
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_rep_chunk_boundary(void);
+
+/**
+ * qemu_plugin_cond_branch_taken() - resolved runtime direction of the last
+ * conditional branch this vCPU executed
+ *
+ * Returns the way the most recently executed conditional branch actually
+ * went: true if its taken arm ran, false if it fell through.  The value is
+ * produced by the branch's own target translation — a constant stored on each
+ * arm right before its goto_tb — so it is QEMU's resolved outcome and not a
+ * re-evaluation of the condition by the caller.
+ *
+ * This is the only honest source of the direction for a branch whose taken
+ * target coincides with its fall-through — x86 `jcc` to the next instruction,
+ * aarch64 `b.cond`/cbz/tbz to the next instruction, riscv `beq .+<insnlen>`,
+ * mips `bgtz/blez rs,.+8` whose delay slot puts both edges at the same PC —
+ * where the successor PC is identical for taken and not-taken, so no
+ * inference over PCs can recover which outcome occurred.
+ *
+ * Read it together with qemu_plugin_cond_branch_pc(), which names the branch
+ * the direction describes: a consumer reaching the pair later than the
+ * execution it belongs to (a deferred seal, an intervening foreign or async
+ * TB) compares that PC against the branch it is attributing and falls back to
+ * its own inference when they differ, rather than crediting another branch's
+ * outcome.  Valid for the instruction most recently executed on this vCPU
+ * (a wrong-path excursion's speculative branches update it too); read it
+ * before running further guest code.  Reads false before any conditional
+ * branch has executed.  Must be called from a vCPU context.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_cond_branch_taken(void);
+
+/**
+ * qemu_plugin_cond_branch_pc() - which branch the resolved direction describes
+ *
+ * Returns the virtual address of the conditional branch instruction whose
+ * direction qemu_plugin_cond_branch_taken() reports — the same address
+ * qemu_plugin_insn_vaddr() gives for that branch.  A consumer compares this
+ * against the terminal branch it is attributing and falls back to its own
+ * inference when they differ (the pair then describes some other, later
+ * branch, e.g. after a deferred seal or an intervening TB).  Reads zero when
+ * no conditional branch has executed on this vCPU yet, or the last control
+ * transfer was not an instrumented conditional branch.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_cond_branch_pc(void);
 
 /**
  * qemu_plugin_spec_store_overflowed() - did the current wrong-path excursion's

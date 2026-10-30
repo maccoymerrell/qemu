@@ -787,6 +787,42 @@ struct CPUState {
     uint64_t plugin_rep_bytes;
     void *plugin_mops_report;
 
+    /*
+     * RESOLVED RUNTIME DIRECTION OF THE LAST CONDITIONAL BRANCH this vCPU
+     * executed.  Written by target-generated TCG at the branch's own
+     * translation: a constant 1 is stored on the taken arm and a constant 0
+     * on the fall-through arm, right before each goto_tb, so at runtime the
+     * field holds which arm actually executed — QEMU's own resolved outcome,
+     * never a re-evaluation of the condition by a consumer.  It exists because
+     * a conditional branch whose taken target coincides with its fall-through
+     * (x86 `jcc .+0`, aarch64 `b.cond`/cbz/tbz to the next insn, riscv
+     * `beq .+<insnlen>`, mips `bgtz/blez rs,.+8` where the delay slot puts both
+     * edges at the same PC) leaves a PC-only consumer no way to tell a taken
+     * from a not-taken execution: both reach the same successor, so the only
+     * honest source of the direction is the machine that resolved it.
+     *
+     * plugin_cond_branch_pc NAMES the branch the pair describes (the branch
+     * instruction's own virtual address — the same identity a consumer holds
+     * for a terminal branch), so a consumer that reaches the pair later than
+     * the execution it belongs to (a deferred seal, an intervening foreign or
+     * async TB) can tell the pair is not this branch's and fall back to its
+     * own inference rather than crediting another branch's outcome.  Zero
+     * means no conditional branch has been resolved on this vCPU yet, or the
+     * last control transfer was not an instrumented conditional branch.
+     *
+     * Declared inside CONFIG_PLUGIN: the only writer is the plugin-gated TCG
+     * helper (translator_plugin_cond_branch, guarded by
+     * DisasContextBase::plugin_enabled) and the only reader is the plugin API
+     * (qemu_plugin_cond_branch_pc / _taken).  The exposure is one-way,
+     * QEMU -> trace; the plugin never writes it.  No save/restore across a
+     * speculative excursion is needed: a correct-path consumer latches the
+     * pair at TB entry BEFORE any wrong-path excursion is kicked, and the
+     * correct path's own next branch re-stamps the field afterwards, while a
+     * wrong-path consumer reads the live field as each speculative TB runs.
+     */
+    uint64_t plugin_cond_branch_pc;
+    bool plugin_cond_branch_taken;
+
     /* Wrong-path speculative execution state.  Sandbox is indexed by
      * cache-line address (64-byte aligned) — an 8-byte store costs
      * one hash op instead of eight, and a vector store within a line

@@ -32,6 +32,12 @@ typedef struct DisasContext {
     MemOp default_tcg_memop_mask;
     uint32_t hflags, saved_hflags;
     target_ulong btarget;
+    /* PC of the branch instruction whose transfer gen_branch() completes
+     * after the delay slot.  Captured in gen_compute_branch() (where
+     * base.pc_next still names the branch, not the delay slot that follows)
+     * so the plugin conditional-branch stamp in gen_branch() can name the
+     * branch by its own address. */
+    target_ulong bbranch_pc;
     bool ulri;
     int kscrexist;
     bool rxi;

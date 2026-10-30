@@ -5278,6 +5278,11 @@ static void gen_compute_branch(DisasContext *ctx, uint32_t opc,
     }
 
     ctx->btarget = btgt;
+    /* Remember the branch instruction's own PC: base.pc_next names the
+     * branch here, but by the time gen_branch() runs the transfer it names
+     * the delay slot.  The plugin conditional-branch stamp needs the branch
+     * PC to identify the branch it describes. */
+    ctx->bbranch_pc = ctx->base.pc_next;
     /*
      * Surface the resolved static target to plugins for wrong-path
      * tracing.  Indirect branches (OPC_JR/OPC_JALR) leave btgt at
@@ -11694,8 +11699,16 @@ static void gen_branch(DisasContext *ctx, int insn_bytes)
                 TCGLabel *l1 = gen_new_label();
 
                 tcg_gen_brcondi_tl(TCG_COND_NE, bcond, 0, l1);
+                /* Fall-through arm (bcond == 0): not-taken.  Stamped for
+                 * plugins before the goto_tb so `bgtz/blez rs,.+8`, whose
+                 * delay slot puts the taken edge at the fall-through PC,
+                 * still publishes its real direction. */
+                translator_plugin_cond_branch(&ctx->base,
+                                              (uint64_t)ctx->bbranch_pc, false);
                 gen_goto_tb(ctx, 1, ctx->base.pc_next + insn_bytes);
                 gen_set_label(l1);
+                translator_plugin_cond_branch(&ctx->base,
+                                              (uint64_t)ctx->bbranch_pc, true);
                 gen_goto_tb(ctx, 0, ctx->btarget);
             }
             break;

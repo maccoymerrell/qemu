@@ -35,6 +35,30 @@ static void set_can_do_io(DisasContextBase *db, bool val)
                     offsetof(ArchCPU, env));
 }
 
+void translator_plugin_cond_branch(const DisasContextBase *db,
+                                   uint64_t branch_pc, bool taken)
+{
+#ifdef CONFIG_PLUGIN
+    if (!db->plugin_enabled) {
+        return;
+    }
+    /*
+     * Same tcg_env -> CPUState relocation set_can_do_io and the icount
+     * accessors use.  One i8 store for the resolved direction, one i64
+     * store for the branch's identity; both are translation-time constants
+     * on each arm, so the arm that runs leaves the pair naming this branch
+     * and the way it went.
+     */
+    QEMU_BUILD_BUG_ON(sizeof_field(CPUState, plugin_cond_branch_taken) != 1);
+    tcg_gen_st8_i32(tcg_constant_i32(taken ? 1 : 0), tcg_env,
+                    offsetof(ArchCPU, parent_obj.plugin_cond_branch_taken) -
+                    offsetof(ArchCPU, env));
+    tcg_gen_st_i64(tcg_constant_i64(branch_pc), tcg_env,
+                   offsetof(ArchCPU, parent_obj.plugin_cond_branch_pc) -
+                   offsetof(ArchCPU, env));
+#endif
+}
+
 bool translator_io_start(DisasContextBase *db)
 {
     /*

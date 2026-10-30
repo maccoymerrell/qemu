@@ -1681,6 +1681,23 @@ bool qemu_plugin_rep_chunk_boundary(void)
     return current_cpu ? current_cpu->plugin_rep_chunk : false;
 }
 
+/*
+ * Resolved runtime direction of the last conditional branch this vCPU ran,
+ * and the branch it describes.  Both are written by target-generated TCG from
+ * the branch's own translation (a constant per arm), so they are QEMU's
+ * outcome and not a re-evaluation of the condition here.  Targets with no
+ * instrumented conditional branch leave them {0, false}.
+ */
+bool qemu_plugin_cond_branch_taken(void)
+{
+    return current_cpu ? current_cpu->plugin_cond_branch_taken : false;
+}
+
+uint64_t qemu_plugin_cond_branch_pc(void)
+{
+    return current_cpu ? current_cpu->plugin_cond_branch_pc : 0;
+}
+
 bool qemu_plugin_spec_store_overflowed(void)
 {
 #ifdef CONFIG_USER_ONLY

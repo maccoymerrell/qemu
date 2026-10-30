@@ -296,4 +296,26 @@ size_t translator_st_len(const DisasContextBase *db);
  */
 bool translator_is_same_page(const DisasContextBase *db, vaddr addr);
 
+/**
+ * translator_plugin_cond_branch
+ * @db: disassembly context
+ * @branch_pc: virtual address of the conditional branch instruction
+ * @taken: the arm this generated code belongs to (true = taken edge,
+ *         false = fall-through edge)
+ *
+ * Emit TCG that publishes, to a loaded plugin, which arm of a conditional
+ * branch actually executes.  Called once on each arm with a translation-time
+ * constant @taken, right before that arm's goto_tb/exit, so at runtime the
+ * per-vCPU CPUState fields plugin_cond_branch_pc / plugin_cond_branch_taken
+ * hold the branch's own PC and its resolved direction.  This is QEMU's real
+ * runtime outcome — the only honest source of the direction for a branch
+ * whose taken target coincides with its fall-through, where a PC-based
+ * inference can never tell the two outcomes apart.  A no-op when no plugin is
+ * instrumenting this TB (DisasContextBase::plugin_enabled is false) and when
+ * CONFIG_PLUGIN is not configured.  Targets call it only on genuinely
+ * conditional direct branches; an unconditional transfer names no direction.
+ */
+void translator_plugin_cond_branch(const DisasContextBase *db,
+                                   uint64_t branch_pc, bool taken);
+
 #endif /* EXEC__TRANSLATOR_H */

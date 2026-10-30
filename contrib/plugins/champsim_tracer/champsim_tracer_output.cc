@@ -683,6 +683,12 @@ struct BodyStreamState {
     /* Previous CP entry's template, so the *next* CP entry can
      * classify the prior BB's terminal-branch outcome for §6. */
     BBTemplate *prev_cp_tmpl;
+    /* QEMU's resolved direction of that previous CP entry's terminal branch
+     * (-1 none / 0 / 1), carried alongside prev_cp_tmpl so the deferred
+     * profile_branch classification uses the same truth as the wire's
+     * CST_FID_BRANCH_TAKEN instead of re-inferring from the successor PC
+     * (which collapses to not-taken for a coincident-edge branch). */
+    int8_t  prev_cp_branch_dir = -1;
     /* False until the first BODY_TAG_THREAD_SWITCH; forces it so the
      * starting thread is an explicit delta-from-0, no implicit base. */
     bool    thread_announced;
@@ -1645,6 +1651,12 @@ struct EntryView {
      * CST_BB_FLAG_BRANCH_UNRESOLVED instead (§5.6). */
     bool     branch_known;
     uint64_t branch_successor_pc;
+    /* QEMU's resolved terminal-branch direction: -1 none (use the
+     * successor-vs-fall-through inference), 0 not-taken, 1 taken.  The only
+     * truthful source for a coincident-edge branch, whose successor PC is the
+     * same both ways; it overrides the inference at the CST_FID_BRANCH_TAKEN
+     * staging site. */
+    int8_t   branch_dir_resolved = -1;
     /* Executed range [bb_start, bb_stop) — the ONLY instruction positions
      * this entry may stage records at (§4.2a).  Staged as block records
      * at BLOCK_POS against defaults 0 / tmpl->n_insns. */
@@ -3339,9 +3351,18 @@ static void emit_field_delta_section(BitWriter *main_bw,
          * (absence + flag; §5.6).
          *
          * TAKEN  = the successor diverged from the template's fall-through,
-         *          with unconditional terminators always "taken" — identical
-         *          to profile_branch's classification and to the decoder's
-         *          successor-derived cross-check.
+         *          with unconditional terminators always "taken" — the same
+         *          classification profile_branch and the decoder's
+         *          successor-derived cross-check use.  EXCEPT a conditional
+         *          branch whose QEMU-resolved direction is carried on the
+         *          entry (branch_dir_resolved >= 0): that outcome is
+         *          authoritative and overrides the successor inference.  It is
+         *          the only truthful source for a coincident-edge branch,
+         *          where the taken target equals the fall-through and the
+         *          successor is the same PC both ways, so the inference can
+         *          only ever read not-taken; the decoder's --verify-branch
+         *          accepts the wire's direction for that coincident case
+         *          rather than re-deriving it.
          * TARGET = the branch's landing PC encoded as a SIGNED DISPLACEMENT
          *          from the branch instruction's own PC (successor -
          *          branch_pc), NOT the raw PC.  A direct branch's displacement
@@ -3364,7 +3385,16 @@ static void emit_field_delta_section(BitWriter *main_bw,
                 const InsnFields *bf = &ev->tmpl->insn_fields[bidx];
                 uint64_t target = ev->branch_successor_pc;
                 bool taken = (target != ev->tmpl->fall_through_pc);
-                if (!bf->branch_conditional) taken = true;
+                if (!bf->branch_conditional) {
+                    taken = true;
+                } else if (ev->branch_dir_resolved >= 0) {
+                    /* QEMU's resolved direction is authoritative for a
+                     * conditional branch — the only source that distinguishes
+                     * a taken from a not-taken coincident-edge branch, where
+                     * target == fall_through both ways.  The target
+                     * displacement is unaffected: both edges share the PC. */
+                    taken = (ev->branch_dir_resolved != 0);
+                }
                 uint64_t branch_pc = ev->tmpl->insn_pcs
                     ? ev->tmpl->insn_pcs[bidx] : ev->tmpl->start_pc;
                 /* Signed displacement held two's-complement in a u64; the
@@ -3629,6 +3659,9 @@ struct BBDeltaInput {
     /* Terminal-branch outcome, threaded to the CST_FID_BRANCH_* staging. */
     bool                         branch_known = false;
     uint64_t                     branch_successor_pc = 0;
+    /* QEMU's resolved terminal-branch direction (-1 none / 0 / 1); overrides
+     * the successor-PC inference for a coincident-edge branch. */
+    int8_t                       branch_dir_resolved = -1;
     /* Executed range [bb_start, bb_stop) — REQUIRED, every caller states
      * it explicitly ([0, tmpl->n_insns) for a whole-block run).  Clamps
      * the per-insn staging and rides the wire as the BB_START / BB_STOP
@@ -3684,6 +3717,7 @@ static void emit_one_bb_delta_with_base(BitWriter *bw, BodyStreamState *st,
     ev.cpu_index = cpu_index;
     ev.branch_known         = rec.branch_known;
     ev.branch_successor_pc  = rec.branch_successor_pc;
+    ev.branch_dir_resolved  = rec.branch_dir_resolved;
     ev.bb_flags             = rec.bb_flags;
     ev.fault_depth          = rec.fault_depth;
     ev.fault_insn           = rec.fault_insn;
@@ -3743,6 +3777,7 @@ static void emit_body_record_payload(
     cp_rec.reg_snaps    = &entry->reg_snaps;
     cp_rec.branch_known = entry->branch_successor_known;
     cp_rec.branch_successor_pc = entry->branch_successor_pc;
+    cp_rec.branch_dir_resolved = entry->branch_dir_resolved;
     cp_rec.bb_start     = entry->bb_start;
     cp_rec.bb_stop      = entry->bb_stop;
     cp_rec.bb_flags     = cp_flags;
@@ -3791,6 +3826,7 @@ static void emit_body_record_payload(
             wp_rec.reg_snaps    = &wp->reg_snaps;
             wp_rec.branch_known = wp->branch_successor_known;
             wp_rec.branch_successor_pc = wp->branch_successor_pc;
+            wp_rec.branch_dir_resolved = wp->branch_dir_resolved;
             /* A speculative block carries its OWN range.  Whole for every
              * block the walker ran whole; cut at the wpdepth remainder for
              * the chain's budget-crossing last block (WPBBEntry
@@ -4112,8 +4148,14 @@ static void profile_accumulate(BBTemplate *t,
 /* Terminal-branch outcome (item 2) for the BB whose template is
  * @t, given the next executed PC @next_pc.  taken == control did
  * NOT fall through.  Unconditional/call/ret terminators are always
- * "taken".  No-op when the BB does not end in a branch. */
-static void profile_branch(BBTemplate *t, uint64_t next_pc, bool wp)
+ * "taken".  @dir is QEMU's resolved direction for this execution
+ * (-1 none / 0 not-taken / 1 taken); when present for a conditional
+ * branch it is authoritative over the successor-PC inference — the
+ * only truthful source for a coincident-edge branch, matching the
+ * wire's CST_FID_BRANCH_TAKEN exactly.  No-op when the BB does not
+ * end in a branch. */
+static void profile_branch(BBTemplate *t, uint64_t next_pc, bool wp,
+                           int8_t dir = -1)
 {
     if (!t || t->n_insns == 0) return;
     /* The terminating branch is at template_branch_index (n-1 normally,
@@ -4123,7 +4165,11 @@ static void profile_branch(BBTemplate *t, uint64_t next_pc, bool wp)
     const InsnFields *last = &t->insn_fields[bidx];
     TemplateProfile *p = profile_get(t);
     bool taken = (next_pc != t->fall_through_pc);
-    if (!last->branch_conditional) taken = true;
+    if (!last->branch_conditional) {
+        taken = true;
+    } else if (dir >= 0) {
+        taken = (dir != 0);
+    }
     if (wp) {
         if (taken) p->br_taken_wp++; else p->br_nottaken_wp++;
     } else {
@@ -4169,16 +4215,23 @@ static void accumulate_template_profiles(BodyStreamState *st, BodyEntry *entry,
 {
     profile_accumulate(entry->tmpl, entry->dyn_params, false);
     if (st->prev_cp_tmpl && entry->tmpl) {
-        profile_branch(st->prev_cp_tmpl, entry->tmpl->start_pc, false);
+        /* The prev CP BB's direction was resolved when it was emitted; use
+         * that QEMU truth (carried on prev_cp_branch_dir) so the profile's
+         * taken/not-taken counters match the wire's CST_FID_BRANCH_TAKEN on
+         * a coincident-edge branch instead of re-inferring not-taken. */
+        profile_branch(st->prev_cp_tmpl, entry->tmpl->start_pc, false,
+                       st->prev_cp_branch_dir);
     }
     if (entry->tmpl) {
         st->prev_cp_tmpl = entry->tmpl;
+        st->prev_cp_branch_dir = entry->branch_dir_resolved;
     }
     for (uint32_t w = 0; w < num_wp; w++) {
         WPBBEntry &wp = entry->wp_entries[w];
         profile_accumulate(wp.tmpl, wp.dyn_params, true);
         if (!wp.fault && w + 1 < num_wp) {
-            profile_branch(wp.tmpl, entry->wp_entries[w + 1].start_pc, true);
+            profile_branch(wp.tmpl, entry->wp_entries[w + 1].start_pc, true,
+                           wp.branch_dir_resolved);
         }
     }
 }

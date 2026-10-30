@@ -60,6 +60,12 @@ struct PendingEmit {
     uint64_t    branch_pc;
     uint64_t    emit_current_pc;
     uint64_t    wrong_target;
+    /* QEMU's resolved direction of this BB's terminal conditional branch,
+     * as a tri-state: -1 = none/unknown (consumer keeps its successor-PC
+     * inference), 0 = not-taken, 1 = taken.  Authoritative for a
+     * coincident-edge branch; set only when QEMU's latched branch PC matches
+     * this BB's terminal branch PC (collect_finalized_bbs). */
+    int8_t      branch_dir = -1;
 };
 
 /* The fragment walk over the deferred prev TB: folds executed fragments
@@ -99,7 +105,8 @@ void emit_finalized_bb(BodyStreamState *out_stream,
                        uint64_t wrong_target,
                        unsigned int cpu_index,
                        uint32_t bb_start = 0,
-                       bool thread_end = false);
+                       bool thread_end = false,
+                       int8_t branch_dir = -1);
 
 /* Build a BodyEntry from the calling thread's CP memop/reg-snap
  * accumulators (draining them FOR THE DECLARED RANGE) and write it to
@@ -128,7 +135,8 @@ void emit_body_entry(BodyStreamState *out_stream,
                      bool branch_successor_known,
                      uint32_t bb_start,
                      uint32_t bb_stop,
-                     bool thread_end = false);
+                     bool thread_end = false,
+                     int8_t branch_dir = -1);
 
 /* CP-step accumulators owned by champsim_tracer.cc.  PathBuilder moves
  * them into / out of its frames (the stash and the merge re-injection)

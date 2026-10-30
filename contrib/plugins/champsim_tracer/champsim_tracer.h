@@ -1162,6 +1162,12 @@ struct WPBBEntry {
      * and delta-encode through the per-chain WP overlay. */
     uint64_t branch_successor_pc = 0;
     bool     branch_successor_known = false;
+    /* QEMU's resolved direction of this speculative block's terminal
+     * conditional branch (same tri-state as BodyEntry::branch_dir_resolved):
+     * -1 none, 0 not-taken, 1 taken.  Set in wp_commit_bb from the wrong-path
+     * latch when the latched branch PC matches this block's terminal branch;
+     * authoritative for a coincident-edge branch reached on the wrong path. */
+    int8_t   branch_dir_resolved = -1;
 };
 
 struct BodyEntry {
@@ -1241,6 +1247,13 @@ struct BodyEntry {
      * docs/format.rst §5.6. */
     uint64_t branch_successor_pc = 0;
     bool     branch_successor_known = false;
+    /* QEMU's resolved direction of this BB's terminal conditional branch:
+     * -1 = none (the CST_FID_BRANCH_TAKEN writer keeps its successor-vs-
+     * fall-through inference), 0 = not-taken, 1 = taken.  Authoritative for a
+     * coincident-edge branch, whose successor PC is identical for both
+     * outcomes.  Set from the seal (collect_finalized_bbs) via emit_finalized_bb;
+     * -1 on every flush/cut/unresolved path, which carry no observed direction. */
+    int8_t   branch_dir_resolved = -1;
 };
 #endif  /* __cplusplus */
 

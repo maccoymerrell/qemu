@@ -52,6 +52,28 @@ struct Stats {
     uint64_t branches_taken = 0;
     uint64_t branches_not_taken = 0;
 
+    /*
+     * Conditional-branch direction provenance (CP seal).  When QEMU's
+     * resolved direction (plugin_cond_branch_*) is available for the terminal
+     * branch being sealed — i.e. its latched PC matches the branch's PC —
+     * it is compared against the plugin's own successor-PC inference:
+     *   cond_branch_qemu_agree     QEMU == inference (ordinary branch; the
+     *                              wiring is proven live by this firing).
+     *   cond_branch_coincident_fix QEMU says taken, inference says not-taken:
+     *                              a coincident-edge branch (taken target ==
+     *                              fall-through) resolved TAKEN — the defect
+     *                              this change fixes, firing as intended.
+     *   cond_branch_dir_mismatch   QEMU says not-taken, inference says taken:
+     *                              a contradiction that must never occur on a
+     *                              real run (a matched PC with the successor
+     *                              off the fall-through while QEMU fell
+     *                              through).  A non-zero value is a wiring
+     *                              bug, not an expected outcome.
+     */
+    uint64_t cond_branch_qemu_agree = 0;
+    uint64_t cond_branch_coincident_fix = 0;
+    uint64_t cond_branch_dir_mismatch = 0;
+
     /* Wrong-path simulator. */
     uint64_t wp_simulations = 0;
     uint64_t wp_skipped = 0;

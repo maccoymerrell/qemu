@@ -2920,18 +2920,22 @@ PathBuilder::complete_continuation(size_t idx,
     if (suffix_whole && pe.bb_tmpl) {
         g_stats.merge_cut_frame_suffix_insns += pe.bb_tmpl->n_insns;
         emit_finalized_bb(out_stream, pe.bb_tmpl, pe.branch_pc,
-                          pe.emit_current_pc, cont_wrong, cpu_index, 0);
+                          pe.emit_current_pc, cont_wrong, cpu_index, 0,
+                          /*thread_end=*/false, /*branch_dir=*/pe.branch_dir);
     } else {
         emit_finalized_bb(out_stream, full, pe.branch_pc,
                           pe.emit_current_pc, cont_wrong, cpu_index,
-                          cont_start);
+                          cont_start,
+                          /*thread_end=*/false, /*branch_dir=*/pe.branch_dir);
     }
     g_cst_emit_site = "seal";
     for (size_t i = 1; i < pending_emits.size(); i++) {
         const PendingEmit &pe2 = pending_emits[i];
         rep_emit_handoff(cpu_index, rep_state(cpu_index).pb_walk_facts);
         emit_finalized_bb(out_stream, pe2.bb_tmpl, pe2.branch_pc,
-                          pe2.emit_current_pc, pe2.wrong_target, cpu_index);
+                          pe2.emit_current_pc, pe2.wrong_target, cpu_index,
+                          /*bb_start=*/0, /*thread_end=*/false,
+                          /*branch_dir=*/pe2.branch_dir);
     }
     return StepStatus::SEALED;
 }
@@ -3759,7 +3763,8 @@ PathBuilder::StepStatus PathBuilder::step_seal(const StepIn &in,
         emit_finalized_bb(out_stream, pe.bb_tmpl, pe.branch_pc,
                           pe.emit_current_pc, pe.wrong_target, in.cpu_index,
                           /*bb_start=*/0,
-                          /*thread_end=*/stamp_thread_end && last);
+                          /*thread_end=*/stamp_thread_end && last,
+                          /*branch_dir=*/pe.branch_dir);
     }
     if (stamp_thread_end) {
         seal_stamped_thread_end_ = true;

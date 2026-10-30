@@ -699,6 +699,16 @@ static WpStep wp_exec_one_tb(WpWalkState &st)
         rep_state(g_wp_state.saved_cpu_index).wp_facts.complete = qemu_plugin_rep_complete();
         rep_state(g_wp_state.saved_cpu_index).wp_facts.reenter  = qemu_plugin_rep_reenter();
 
+        /* QEMU's resolved direction of the TB just speculated, latched the
+         * same way as the rep facts: the wrong path executes the identical
+         * conditional-branch translation, so a coincident-edge branch found
+         * on the wrong path publishes its real speculative direction here
+         * rather than collapsing to not-taken through the successor PC. */
+        rep_state(g_wp_state.saved_cpu_index).wp_cond_branch_pc    =
+            qemu_plugin_cond_branch_pc();
+        rep_state(g_wp_state.saved_cpu_index).wp_cond_branch_taken =
+            qemu_plugin_cond_branch_taken();
+
         if (!tmpl) {
             /* A tb_flush during this exec_tb unwound it (via cpu_loop_exit,
              * caught by cpu_plugin_exec_tb's local guard) before the guest
@@ -1258,6 +1268,27 @@ static void wp_commit_bb(WpWalkState &st, BBTemplate *cur,
                                                     bb_first_fault_idx);
                 wp_entry.branch_successor_pc    = commit_post_pc;
                 wp_entry.branch_successor_known = true;
+                /*
+                 * QEMU's resolved direction for this speculative block's
+                 * terminal conditional branch, symmetric to the CP seal: a
+                 * coincident-edge branch reached on the wrong path records its
+                 * real speculative direction instead of collapsing to
+                 * not-taken through commit_post_pc.  Authoritative only when
+                 * the wrong-path latch names THIS block's terminal branch
+                 * (the just-speculated TB's last conditional branch); a
+                 * mid-TB fragment that fell through keeps the successor-PC
+                 * inference. */
+                {
+                    int wbr = TemplateStore::template_branch_index(bb_tmpl);
+                    if (wbr >= 0 &&
+                        bb_tmpl->insn_fields[wbr].branch_conditional &&
+                        rep_state(g_wp_state.saved_cpu_index).wp_cond_branch_pc
+                            == bb_tmpl->insn_pcs[wbr]) {
+                        wp_entry.branch_dir_resolved =
+                            rep_state(g_wp_state.saved_cpu_index)
+                                .wp_cond_branch_taken ? 1 : 0;
+                    }
+                }
                 /*
                  * THE CHAIN NEVER ATTRIBUTES PAST THE wpdepth BUDGET.
                  *

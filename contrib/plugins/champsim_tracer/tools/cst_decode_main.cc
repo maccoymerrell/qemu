@@ -2919,10 +2919,20 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
              * agree with each other (taken iff the target left the
              * fall-through, unconditional terminators forced taken) — the
              * writer's own classification, and well-defined even when the
-             * successor is not the continuation. */
+             * successor is not the continuation.
+             *
+             * EXCEPT a coincident-edge conditional branch, whose taken target
+             * IS its fall-through (target == fall_through): there the
+             * direction is not PC-derivable — both outcomes reach the same PC
+             * — so the writer records QEMU's resolved outcome instead, and
+             * either value is architecturally valid.  Accept the wire's
+             * direction there rather than forcing it to the not-taken the
+             * target comparison would compute.  The target check below still
+             * applies (it equals the continuation either way). */
             bool exp_taken = (p.target != p.fall_through);
             if (!p.conditional) exp_taken = true;
-            bool dmism = (p.taken != exp_taken);
+            bool coincident_cond = p.conditional && p.target == p.fall_through;
+            bool dmism = !coincident_cond && (p.taken != exp_taken);
             n_checked++;
             if (dmism) n_taken_mism++;
 
@@ -3094,8 +3104,14 @@ int run_verify_branch(const Options &opts, const cst::Header &h,
             }
             bool exp_taken = (succ != wt->fall_through_pc);
             if (!wcond) exp_taken = true;
+            /* Coincident-edge conditional branch (taken target == fall-through,
+             * so succ == fall_through): the direction is not PC-derivable and
+             * the writer recorded QEMU's resolved speculative outcome; accept
+             * the wire's value rather than forcing not-taken.  Symmetric with
+             * the CP side. */
+            bool coincident_cond = wcond && succ == wt->fall_through_pc;
             bool tmism = (wp.branch.target != succ);
-            bool dmism = (wp.branch.taken != exp_taken);
+            bool dmism = !coincident_cond && (wp.branch.taken != exp_taken);
             n_wp_checked++;
             /* Symmetric with the CP side: a block the wp_events section marks
              * as faulting or untranslatable ends its strand, so its successor

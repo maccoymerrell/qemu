@@ -2300,13 +2300,27 @@ Field families (one canonical name each):
 * **Branch-outcome singletons** (two; always advertised — see §5.6):
 
   * ``CST_FID_BRANCH_TAKEN`` — ``1`` if the BB's terminating branch
-    transferred control (taken), ``0`` if it fell through.
+    transferred control (taken), ``0`` if it fell through.  For a
+    conditional branch this is QEMU's **resolved runtime direction** —
+    the arm that actually executed, stamped by the branch's own
+    translation — not an inference over the recorded successor.  The two
+    coincide for an ordinary branch, but a *coincident-edge* conditional
+    branch, whose taken target equals its fall-through (x86 ``jcc`` to the
+    next instruction, aarch64 ``b.cond``/``cbz``/``tbz`` to the next
+    instruction, riscv ``beq .+<insnlen>``, mips ``bgtz``/``blez`` whose
+    delay slot puts both edges at the same PC), reaches the same successor
+    whichever way it resolved, so only the resolved direction distinguishes
+    a taken from a not-taken execution — and this field carries it.
+    Unconditional terminators are always ``1``.
   * ``CST_FID_BRANCH_TARGET`` — the branch's landing PC encoded as a
     **signed displacement** from the branch instruction's own PC
     (``successor − branch_pc``), *not* the raw PC.  A reader reconstructs
     the absolute successor as ``branch_pc + displacement``.  When not
     taken this displacement resolves to the fall-through, so the field
-    is the architectural successor either way.
+    is the architectural successor either way.  For a coincident-edge
+    branch the two edges share a PC, so the displacement is the same for
+    either direction and ``CST_FID_BRANCH_TAKEN`` is the sole carrier of
+    the outcome.
 
   Both ride the terminating branch instruction's ``ins_pos`` (like
   ``METAFLAGS``), with baseline default zero, and appear on a
@@ -3056,7 +3070,12 @@ outcome explicit, so a consumer never has to decode the successor to
 recover it:
 
 * ``CST_FID_BRANCH_TAKEN`` — ``1`` when the terminating branch transferred
-  control, ``0`` when it fell through.
+  control, ``0`` when it fell through.  For a conditional branch this is
+  QEMU's resolved runtime direction (the arm that executed, stamped by the
+  branch's translation), authoritative over any successor-PC inference — the
+  distinction matters only for a coincident-edge branch (taken target ==
+  fall-through), whose edges share a PC so no inference can recover the
+  outcome; see the ``CST_FID_BRANCH_TAKEN`` note under §5 for the forms.
 * ``CST_FID_BRANCH_TARGET`` — the branch's landing PC encoded as a
   **signed displacement** from the branch instruction's own PC
   (``successor − branch_pc``), *not* the raw PC.  A consumer reconstructs the
@@ -3077,8 +3096,13 @@ branch pays a one-byte direction delta only when its outcome flips; an
 **indirect** branch pays a (still-compact) displacement delta whenever the
 target moves.  A consumer reconstructs the direction it would otherwise
 derive by look-ahead as ``taken == (target != fall_through_pc)``, with an
-unconditional terminator always taken — identical to the writer's
-classification.
+unconditional terminator always taken — the writer's own classification,
+**except** a coincident-edge conditional branch, whose taken target equals
+its fall-through: there ``target == fall_through_pc`` for both outcomes, the
+look-ahead can only ever yield not-taken, and ``CST_FID_BRANCH_TAKEN`` carries
+QEMU's resolved direction instead.  A consumer cross-checking direction
+against the successor (e.g. ``cst_decode --verify-branch``) accepts the wire's
+value for that coincident case rather than re-deriving it.
 
 Coverage and gating:
 

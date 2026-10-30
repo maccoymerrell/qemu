@@ -4911,7 +4911,8 @@ void emit_body_entry(BodyStreamState *out_stream,
                      bool branch_successor_known,
                      uint32_t bb_start,
                      uint32_t bb_stop,
-                     bool thread_end)
+                     bool thread_end,
+                     int8_t branch_dir)
 {
     /*
      * USER-MODE EXACT-BUDGET WINDOW (S18 clean break at the budget).
@@ -5232,6 +5233,7 @@ void emit_body_entry(BodyStreamState *out_stream,
      * derived from it at wire-emit time. */
     entry.branch_successor_pc    = branch_successor_pc;
     entry.branch_successor_known = branch_successor_known;
+    entry.branch_dir_resolved    = branch_dir;
 
     /* CST_JUMP_DIAG: raise the syscall_fault_nesting step/anchor discipline
      * ONLINE, at the emit, with the depth pipeline's live state attached. */
@@ -7059,7 +7061,18 @@ static uint64_t resolve_wrong_target(const BBTemplate *bb_tmpl,
                : current_pc != prev_ft    ? current_pc
                                           : 0;
     if (branch_taken) {
-        /* CP took the branch → WP = the fall-through. */
+        /* CP took the branch → WP = the fall-through.  A coincident-edge
+         * branch has no distinct fall-through to fork: its taken edge IS the
+         * fall-through (*taken_out == prev_ft), so there is no wrong path.
+         * Without this guard a coincident branch newly resolved TAKEN (the
+         * QEMU-direction fix) would fork a speculative walk down the very
+         * path CP just ran — the old always-not-taken inference reached the
+         * `direct_cond && taken_target != prev_ft` test below and returned 0
+         * for the same branch, so this keeps the wrong-path decision
+         * unchanged for coincident branches whichever way they resolve. */
+        if (*taken_out != 0 && *taken_out == prev_ft) {
+            return 0;
+        }
         return prev_ft;
     }
     if (direct_cond && bf->taken_target_pc != 0 &&
@@ -7139,7 +7152,8 @@ void emit_finalized_bb(BodyStreamState *out_stream,
                        uint64_t wrong_target,
                        unsigned int cpu_index,
                        uint32_t bb_start,
-                       bool thread_end)
+                       bool thread_end,
+                       int8_t branch_dir)
 {
     cp_chain(cpu_index).reset();
 
@@ -7217,7 +7231,7 @@ void emit_finalized_bb(BodyStreamState *out_stream,
     emit_body_entry(out_stream, bb_tmpl, cpu_index, std::move(wp_entries),
                     wp_first_tb_unavail, current_pc, /*known=*/true,
                     bb_start, bb_tmpl ? bb_tmpl->n_insns : 0,
-                    thread_end);
+                    thread_end, branch_dir);
 }
 
 /*
@@ -8194,12 +8208,58 @@ bool collect_finalized_bbs(unsigned int cpu_index,
             int br_idx = TemplateStore::template_branch_index(bb_tmpl);
             if (br_idx >= 0) {
                 pe.branch_pc = bb_tmpl->insn_pcs[br_idx];
+
+                /*
+                 * THE TERMINAL BRANCH'S DIRECTION IS QEMU'S, NOT THE PLUGIN'S
+                 * TO INFER FROM PCs (ruling 17).  frag_branch_taken is a
+                 * successor-vs-fall-through inference; for a coincident-edge
+                 * conditional branch (taken target == fall-through) it can only
+                 * ever read NOT-TAKEN, whatever the condition resolved.  When
+                 * QEMU latched a resolved direction for THIS branch — its
+                 * conditional, and the latched branch PC equals this terminal
+                 * branch's PC — that outcome is authoritative.  The latched PC
+                 * guard is what keeps a deferred or foreign-interrupted seal
+                 * (whose latch describes a different TB) on the PC inference.
+                 */
+                const InsnFields *term_bf =
+                    &bb_tmpl->insn_fields[br_idx];
+                int8_t qemu_dir = -1;    /* tri-state: -1 none, 0/1 direction */
+                if (is_last_executed && term_bf->branch_conditional &&
+                    rep_state(cpu_index).cp_cond_branch_pc == pe.branch_pc) {
+                    qemu_dir = rep_state(cpu_index).cp_cond_branch_taken
+                        ? 1 : 0;
+                }
+
+                bool auth_taken = frag_branch_taken;
+                if (qemu_dir >= 0) {
+                    bool qd = (qemu_dir != 0);
+                    auth_taken = qd;
+                    pe.branch_dir = qemu_dir;
+                    /*
+                     * Correctness check that the QEMU signal is wired to the
+                     * branch it names: for a NON-coincident branch it must
+                     * equal the PC inference (and does, firing cond_branch_
+                     * qemu_agree on essentially every conditional branch).
+                     * The one legitimate disagreement is the coincident-edge
+                     * TAKEN case (QEMU taken, inference not-taken) — the defect
+                     * this fixes.  The reverse (QEMU not-taken, inference
+                     * taken) is a contradiction that must never fire.
+                     */
+                    if (qd == frag_branch_taken) {
+                        thread_stats_get().cond_branch_qemu_agree++;
+                    } else if (qd && !frag_branch_taken) {
+                        thread_stats_get().cond_branch_coincident_fix++;
+                    } else {
+                        thread_stats_get().cond_branch_dir_mismatch++;
+                    }
+                }
+
                 BranchRecord *br = observe_branch_transition(
-                    bb_tmpl, frag_branch_taken, pe.branch_pc,
+                    bb_tmpl, auth_taken, pe.branch_pc,
                     frag_prev_ft);
                 uint64_t taken_target = 0;
                 pe.wrong_target = resolve_wrong_target(
-                    bb_tmpl, br, frag_branch_taken,
+                    bb_tmpl, br, auth_taken,
                     frag_current_pc, frag_prev_ft, &taken_target);
                 uint64_t raw_wrong = pe.wrong_target;
                 if (taken_target != 0) {
@@ -9729,6 +9789,16 @@ static void vcpu_tb_exec(unsigned int cpu_index, void *udata)
     rep_state(cpu_index).cp_facts.complete = qemu_plugin_rep_complete();
     rep_state(cpu_index).cp_facts.reenter  = qemu_plugin_rep_reenter();
     rep_state(cpu_index).cp_facts.chunk    = qemu_plugin_rep_chunk_boundary();
+
+    /* Latch QEMU's RESOLVED direction of the just-finished TB's terminal
+     * conditional branch, HERE and BEFORE any wrong-path excursion is kicked
+     * (an excursion re-stamps the per-vCPU field as it speculates): this
+     * dispatch's copy is the only valid source for the correct-path seal
+     * collect_finalized_bbs is about to perform.  The pc pins which branch
+     * the direction describes, so a deferred or foreign-interrupted seal
+     * falls back to its PC inference rather than crediting this. */
+    rep_state(cpu_index).cp_cond_branch_pc    = qemu_plugin_cond_branch_pc();
+    rep_state(cpu_index).cp_cond_branch_taken = qemu_plugin_cond_branch_taken();
 
     /* Latch the async-exclusion decision for this TB's body callbacks
      * (see g_capture_mute) before any early return below — the dropped

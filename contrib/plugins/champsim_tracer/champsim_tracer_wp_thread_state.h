@@ -333,6 +333,24 @@ struct RepSelfLoopState {
     RepInFlight  cp_in_flight;
     RepArchFacts wp_facts;      /* wrong-path latch (independent walk) */
     RepInFlight  wp_in_flight;
+
+    /*
+     * QEMU's RESOLVED conditional-branch direction, latched per path for the
+     * TB that just finished (qemu_plugin_cond_branch_pc / _taken).  The pair
+     * names the branch by its own PC so a consumer can confirm it describes
+     * the terminal branch it is about to classify and fall back to its PC
+     * inference otherwise.  cp_* latched at the top of vcpu_tb_exec BEFORE any
+     * wrong-path excursion is kicked; wp_* latched after each speculative
+     * exec_tb in the wrong-path walk.  Authoritative for a coincident-edge
+     * conditional branch, where the successor PC is the same for taken and
+     * not-taken and the PC inference can only ever read not-taken.  _pc == 0
+     * means no instrumented conditional branch resolved on that path's last
+     * TB (an unconditional/indirect terminator, or a target with the stamp
+     * absent): the consumer keeps its own inference. */
+    uint64_t cp_cond_branch_pc = 0;
+    bool     cp_cond_branch_taken = false;
+    uint64_t wp_cond_branch_pc = 0;
+    bool     wp_cond_branch_taken = false;
     /* Per-iteration destination captures (RepIterRegFifo), one queue per
      * path: the wrong path's is cleared before every speculated exec_tb. */
     RepIterRegFifo cp_iter_regs;

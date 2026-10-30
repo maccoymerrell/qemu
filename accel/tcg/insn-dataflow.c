@@ -1107,11 +1107,36 @@ static void df_call(InsnDataflow *d, TCGOp *op)
                      prov, true, false);
     }
     /*
-     * A helper that performs the instruction's load returns what it loaded
-     * (insn_dataflow_note_helper_rmw).  No qemu_ld op exists to seat that
-     * value's bit, so the results carry it from here.
+     * AN ATOMIC RMW HELPER RETURNS THE OLD MEMORY VALUE, AND ONLY THAT.
+     *
+     * insn_dataflow_note_helper_rmw() marks the one call that lowers an
+     * instruction's read-modify-write under CF_PARALLEL: the fetch-* AMOs,
+     * amoswap, xchg and the cmpxchg family all return the prior contents of
+     * the addressed location.  No qemu_ld op exists to seat that loaded
+     * value's bit, so the call's results carry it from here -- but ONLY it.
+     *
+     * The blanket "every result depends on every argument" rule this function
+     * applies to an opaque helper is the right over-approximation when the
+     * result is unknown; here it is known, so it widens the account instead of
+     * bounding it.  The result is the datum the load delivered, not a function
+     * of the address or the stored operand, and the serial expansion of the
+     * SAME encoding proves it: a real qemu_ld whose value flows to the
+     * destination, giving a destination that names that load alone.  Carrying
+     * the full argument union forward would make one encoding publish a wider
+     * destination under CF_PARALLEL than on the serial route (measured on
+     * riscv `sc.w'/`amoadd.w': dst=0x7 against the serial dst=0x4, the extra
+     * bits being the address and store-operand registers).  A later op that
+     * combines the loaded value with another input -- sc's success flag, an
+     * x86 lock-RMW's flags -- names that input itself, as its own op, so
+     * confining the call result to the load loses nothing the instruction
+     * genuinely carries.
+     *
+     * The env-pointer destination buffers added above keep the whole read
+     * side: those really are written from every argument, and an atomic RMW
+     * helper has none of them.
      */
     if (d->helper_load) {
+        memset(prov, 0, sizeof(prov));
         df_set_bit(prov, INSN_DF_BIT_MEMOP0 + d->helper_load_row);
     }
     for (unsigned i = 0; i < nb_oargs; i++) {

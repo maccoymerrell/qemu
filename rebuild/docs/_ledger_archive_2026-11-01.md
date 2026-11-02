@@ -1,0 +1,533 @@
+# Archived task ledger — 2026-11-01
+
+*This is the full 514-row session task ledger as it stood on 2026-11-01, the day
+the live list was cleared. It is **archaeology** from the pre-restart program
+(ARC 1–4, the deleted champsim-rebuild/clean-rebuild attempts, the J7/R14
+Capstone-removal series, the F-series WP work) and from the golden tracer's own
+development. It is preserved here, git-tracked, for one active purpose: the
+rebuild's **lessons doc** mines it for the golden-bug receipts and the
+hard-won findings (WP leaks, SMP attribution, stall/#106, the deferred-emit
+fabrication #79/#81, REP/MOPS, close routes, identity/latch, etc.). The live
+task list was cleared after this file landed so the per-turn replay stops; this
+file is the record.*
+
+*Status tags are as the ledger carried them (`completed` / `pending` /
+`in_progress`). Nothing here is a live rebuild task — the rebuild's own tracking
+starts fresh.*
+
+---
+
+- **#1** [completed] Land validator silent-false-success fix
+- **#2** [completed] Run gate 4 (validator full) on a COMPLETE build
+- **#3** [completed] DONE: adversarial marker wave ported to all 4 ISAs (proof of ruling → #21)
+- **#4** [completed] DONE-ALREADY (triage-verified): gate-6 marker+simpoint composition landed — validator/__main__.py:752-764, wire-judged _chk_system_simpoint wired at _full.py:2368
+- **#5** [completed] Gate 7: pinned-but-not-tracing performance table
+- **#6** [completed] RESOLVED not-a-bug: user-mode ignores markers by design
+- **#7** [completed] Implement idle-close tripwire (off by default, CLA-tunable)
+- **#8** [completed] RESOLVED: dead_latch_x86 was a racy CHECK; detector was correct
+- **#9** [completed] DONE-ALREADY (triage-verified): dead-latch holes closed — deadlatch_beat/UIC_STRIDE cc:404-411 + deadlatch_live_probe required at cc:7279 (b19a3cf44c) + must-fire validator cell; hole 3 = documented behavior
+- **#10** [pending] OPTIMIZE: coarse fast-forward is disabled on SMP — the case that matters most
+- **#11** [completed] FIXED mipsel: straddling marker loss — decided by physical page pair
+- **#12** [completed] DEFECT mipsel: END on an unlearned page closes nothing (narrow-ASID owner map)
+- **#13** [completed] FIXED riscv64: WP excursion erased MIP_MSIP (caught in the act, A/B proven)
+- **#14** [completed] FIXED: system-mode multi-cluster simpoint (it NEVER worked — not a regression)
+- **#15** [completed] DONE: WP leak class hunt — instrument built, 5 findings (see #16-#19)
+- **#16** [completed] STALE→RESOLVED: x86 WP WRMSR MTRR/MCE gating HAS landed (verified against the scored binary's DWARF by verdict42)
+- **#17** [completed] FIXED: PTW device-read escape gated on all 4 targets (latent, not active)
+- **#18** [completed] FIXED mipsel: CP0_Cause replay mechanism built — 61.7% of UART IRQs were being lost
+- **#19** [completed] FIXED riscv64: external_seip/hgeip/breakpoint pointers carried live-forward
+- **#20** [completed] HANG CLASS RESOLVED into causes: riscv=queue (fixed), mipsel=latch violation (→#37/#40)
+- **#21** [completed] DONE: unified tree proves the marker ruling; no interaction defects
+- **#22** [completed] cst_audit reg-snap oracle fails cross-ISA (747/20179 historical stats)
+- **#23** [completed] MERGED into #26 — --disable-plugins build fix
+- **#24** [pending] Gate 7 perf numbers are benchmark-inflated — re-measure on a realistic workload
+- **#25** [completed] DISCHARGED: TLB-contents + QOM-device oracles HAVE now run on loaded STALLING cells — clean
+- **#26** [completed] DONE: local NOTES.md + malta SMP fix + --disable-plugins fix
+- **#27** [pending] FOLLOW-UP: second snapshot region for WP fidelity of reset-surviving state
+- **#28** [completed] FIXED: malta MT DVPE/EVPE — the issuing VPE is the one VPE DVPE may not disable
+- **#29** [completed] FIXED (upstream QEMU): host_sigbus_handler MMU_INST_FETCH guard + wrong-path departure
+- **#30** [completed] RESOLVED BY CONTRARY MEASUREMENT: mipsel multi-vCPU marker coverage structurally unobtainable — 34Kf refused at install (cc:13194+), P5600 onlines 1 CPU; scope boundary per project_mipsel_smp_untestable
+- **#31** [completed] DISSOLVED by the latch reduction: the narrow-owner phantom window was a root-identity mechanism; content-as-gate has no owner map (g_pin_reuse_guard: zero refs at tip)
+- **#32** [pending] Coarse fast-forward is not re-armed between simpoint clusters
+- **#33** [completed] BAR MET per Q2 (APPROVED): x86_64 smp=1 + the wire-judged full-suite check is the Phase-1 bar; broader coverage is validator debt
+- **#34** [completed] DONE-ALREADY: foreign-span retention bound superseded — zero refs to SUSPENDED_FOREIGN/CST_NO_FSPAN_BOUND; suspend-or-seal rearch replaced the design
+- **#35** [completed] CLOSED: mipsel 640s bimodality — original cell is REFUSED by the tracer; substitute cell measured 0/30
+- **#36** [completed] FIXED+REPRODUCED: producer event queue is now bounded (was the riscv/queue root cause)
+- **#37** [completed] FIXED (fork case): QEMU-side identity closes the mipsel latch violation; wrap case → #43/#45
+- **#38** [completed] SUPERSEDED: in-tree thread_test/mt_test drive real cross-vCPU migration; #96/#97 finished to proof power
+- **#39** [completed] Every cell must prove its workload RAN TO COMPLETION (crash/cap confounder)
+- **#40** [completed] DONE-ALREADY via simpler primitive: ownership = page-table-root (PWBase/CR3/TTBR0/SATP), unforgeable by fork; rejected code-page machinery deleted (cc:1627-1633)
+- **#41** [completed] DONE-ALREADY: execve-inside-window scope correction documented — _attach-after-execve anchor at docs/quickstart.rst:278
+- **#42** [completed] DISSOLVED: root-keyed ownership makes narrow-ASID rollover a non-event (cc:1288-1295); mipsel SMP untestable by construction
+- **#43** [completed] DONE-ALREADY: the re-bind rule was DELETED, not disarmed — "THERE IS NO RE-BIND RULE" cc:1604, zero code refs
+- **#44** [completed] DISSOLVED by the latch reduction: no root is ever an identity under content-as-gate, so "recycled root detection" is a non-concept (REDUCTION.md v3 §4; landed b6a76f51cc)
+- **#45** [completed] DONE-ALREADY: refusal on any MIPS model without Config3.PW/PWBase (cc:13194+); P5600 pinned as REQUIRED (_system.py:108-118)
+- **#46** [completed] DONE-ALREADY: the over-deletion repair is fully restored + wired — all four sites (cc:1199/12506, cc:1223/12519, cc:7889/10291, rep_ff_ticks_withheld in stats); gate 6 in the full suite
+- **#47** [pending] WP stuck-bail valves terminate an excursion but are invisible on the wire
+- **#48** [in_progress] ARC 1 umbrella: all known mechanisms fixed and Phase 1 CLOSED at ff315644d4; the class ("guest stops progressing under tracing") stays OPEN BY STANDING RULE — a fix closes a mechanism, never the class
+- **#49** [completed] DONE: ARC 2 — everything consolidated onto champsim-trace, 130 checkouts to 2
+- **#50** [in_progress] ARC 3 RESTARTED CLEAN (2026-09-15): tree reset to ff315644d4 + apparatus (f5a6b2064e); demolition era preserved at refs/arc3/monster-tip + backup branch; design of record = p3/arc3/CLEAN_PLAN.md
+- **#51** [pending] HALF-MOOTED: delivered-artifact half void (package WITHDRAWN per #114/65-A); WIRE half (cqto/cltd/cwtd false RAX WAW/WAR) needs one check against current x86 source
+- **#52** [completed] mipsel P5600 ABI blocker + genuine SMP guest
+- **#53** [completed] BLOCKER: P5600 aborts QEMU in the wrong-path walker (tb->size != 0)
+- **#54** [pending] Rebuild the mipsel base rootfs against a 2008-NaN libc (drop ieee754=relaxed)
+- **#55** [completed] QEMU CPS models one core with N VPs; P5600 can never be multi-vCPU
+- **#56** [completed] DONE-ALREADY: WP fetch faults terminate with explicit markers, DOMAIN_CROSS terminates, back-end continue policy confined (champsim_tracer_wp.cc)
+- **#57** [completed] DONE-ALREADY: cmd_churn_test adjudicates on the ASID-name census with a vacuity guard (__main__.py:1720-1743)
+- **#58** [completed] cst_audit dropped==trimmed fires on ~1-in-3 HEALTHY system marker cells
+- **#59** [completed] FORMAL CLOSE DONE: churn_test x86_64 --system green at ff315644d4 (rc=0, must-0 rows 0, cst_audit rc=0, --strict decode rc=0)
+- **#60** [completed] CLOSED AT SOURCE: decode-into-RAM — lazy disk-backed entries + in-battery residency tripwire
+- **#61** [completed] ARC 3 PREREQ: the MIPS/aarch64 static-decode oracle has no fail condition — it cannot alert
+- **#62** [completed] SUPERSEDED: _ISA_SMP_CPU is now LIVE code — the reduction reopened mipsel SMP and the map boots 34Kf for every mipsel -smp>1 cell (_system.py)
+- **#63** [completed] Round 6 close-drain + hang commits are UNVERIFIED — adversarial round wgity3wh7
+- **#64** [completed] Close-time tail emission violates strict program order — RULED a defect, not a spec question
+- **#65** [completed] Five close holders are gated but never exercised — no real occupant has ever appeared
+- **#66** [completed] riscv64 SIGABRT free(): invalid pointer at tb-size=4 wpdepth=65536
+- **#67** [completed] compress-sink close has no bound and no diagnostic — never attacked
+- **#68** [completed] FIXED (upstream QEMU): riscv itrigger armed a ns timer with a raw instruction count
+- **#69** [completed] RESOLVED: thread_chain runs in the `all` battery, range-aware, green on user+system gates
+- **#70** [completed] DONE-ALREADY: epoch 0x1E emit-at-extent replaced hold-or-drop — 08bf21bb52 + 2aba5a2d65; 5519c86065 is an ancestor of HEAD
+- **#71** [completed] DONE-ALREADY: billed==published at every close route — the block-FID epoch verdict closes the budget-bills-at-execution defect
+- **#72** [completed] REFUTED: close_holder_undrained is blind to a drain that empties without emitting
+- **#73** [completed] CLOSED (e5777394a0): clock_minus_wire carries its user-only scope contract at the emit site
+- **#74** [pending] OPEN: SMP-4 END/shutdown closes leave a user clock-vs-wire residual the census cannot name
+- **#75** [completed] close_in_mid_step does not measure what its name and must-be-0 framing claim
+- **#76** [completed] FIXED (upstream QEMU): riscv itrigger privilege gating + 3 sibling defects, tested
+- **#77** [completed] FIXED (END + EXIT): both closes now seal the stopping block; ledger peak 0 on 8 cells
+- **#78** [completed] CLOSED: all three shutdown-ABBA arms cured at source; aarch64 poweroff arm now measured too
+- **#79** [completed] TRACE-INVALIDATING: a close-drained block publishes register values from the vCPU's state at close, not the instruction's results
+- **#80** [completed] ARC epoch 0x1E: block FIDs at reserved ipos (SETTLED) + doc hardening; then implement writer→decoder→downstream
+- **#81** [completed] TRACE-INVALIDATING: an unresolved terminal branch publishes the previous block's direction and target. *(Found by the refutation lens of wgity3wh7; sibling of #79. Mechanism: CST_FID_BRANCH_TAKEN/_TARGET delta-persist per (ins_pos, fid); emit_field_delta_section stages neither when the successor was never observed, and cst_decode reads the slot's previous occupant and sets branch->valid=true — omission read as repeat, from an unrelated template's branch at the same index. Four emit_body_entry call sites pass branch_successor_known=false (close_walk_emit, fault-frame unwind, close-frame prefix, cut-short walk). Measured x86_64 -smp 4 churn seed 1137: je rendered "taken" against its own STORE_DATA0=0x601 that forbids it. 6494135e39 added branch_outcome_unresolved_cp/_wp visibility + corrected three false justifications; THE DEFECT ITSELF IS OPEN. Fix path (a) do not emit blocks whose terminal outcome was never observed, or (b) explicit unresolved marker at next epoch — never fabricate a default. Oracle gap: nothing checks published branch direction against the same record's memop payload.)*
+- **#82** [completed] OUR BUG, IN TREE NOW: 7f47708d9d committed a factually false CFI justification into two files
+- **#83** [completed] DONE-ALREADY: flush_frame_unwound + close_holder_discarded sites have ZERO code refs at HEAD — the close-walk decomposition deleted them (docs/extending.rst:549)
+- **#84** [completed] Guest RESET is not a close route: the capture survives a machine teardown and reboot
+- **#85** [completed] IDLE/dead-latch close never fired in three sized attempts — the backstop may be inert
+- **#86** [completed] SIGABRT and the realtime gate end runs with an active segment, no census, no stats, orphaned body_tmp
+- **#87** [completed] Per-translation dataflow scratch is 385 KiB of static TLS, charged to every QEMU thread
+- **#88** [completed] DISPOSITIONED instrument-debt: the paused-dump oracle was never adopted as a battery prerequisite; superseded by the exact-stretch instrument; dumpdiff2.py banked (INVALID methodology until adopted)
+- **#89** [completed] Build calibrated-timeout + condition-sampling watchdog (lldet) for validator + lib wrapper
+- **#90** [completed] Stale guest asset: stock systest x86 rootfs cst_trace opens no marker window on current builds
+- **#91** [completed] Fixer 1: validator range-awareness completion (V1-V5) + gate
+- **#92** [completed] rep_split: publish pre-fault retired REP iterations as the rep-split prefix piece
+- **#93** [completed] RULED + ORACLE FIXED (25ad3052ea): a sweep close ends every context unstamped; that is the contract, now written
+- **#94** [pending] Capstone gap: mrs xN, RNDR/RNDRRS NZCV write missing from boundary and fields
+- **#95** [completed] TRIAGED per Q10: operand-order fallback FIXED+LANDED (0be51eb312+7012240504 — 28 keys vanished, riscv64 byte-identical); remainder BENIGN (LLVM under-modeling + tool spelling gaps)
+- **#96** [completed] SMP attribution pair: finish to proof-power standard
+- **#97** [completed] Two SMP census provenance rows still have no falsifier arm
+- **#98** [completed] RETRACTED as framed; the restore defect it was masking is FIXED (e457f63b9a peer-thaw clock)
+- **#99** [completed] FIXED (c7cdf3eddf): the close samples every vCPU's in-flight count before the sinks shut
+- **#100** [completed] CLOSED (e527e27a73): the tb_edge shape HAS a genuine occupant — SMP peer-slot flush in devio_sys_x86_64_smp2
+- **#101** [completed] A single WP excursion can hold a vCPU for 267 ms — the delay is per-excursion, not per-second
+- **#102** [completed] Delay instrument is blind to exec_lock wait — on SMP that is where a machine-wide stall hides
+- **#103** [completed] RESOLVED (41cda51da0): the check was wrong, not the tracer — iframe floor counted over a prologue-stripped slice
+- **#104** [completed] cst_audit completeness Oracle 1 silently does not run on simpoint segment traces
+- **#105** [completed] FIXED (07fb07507f): irreproducibility was host pid + getrandom on the CORRECT path, not WP bails
+- **#106** [completed] DISCHARGED into #147: mechanism found (iothread VIRTUAL consumption racing WP interposition), sole-consumer discipline landed (34e55de9fc), 0/24 at scale
+- **#107** [completed] FIXED (1746348e32): surviving malta stall = wait==0 clamp parking the CP0 timer one 2^32 wrap out
+- **#108** [completed] Two commits on champsim-trace ship a plugin that cannot dlopen — no gate catches it
+- **#109** [completed] Agent T: architectural condition tripwire for the escaped x86 system stall
+- **#110** [completed] FIXED (c1657092ce): TSC/QEMU_CLOCK_VIRTUAL drift closed by removing the second oscillator
+- **#111** [completed] RETIRED per plan: corollary superseded by #147; CST_NOFREEZE (with CST_NO_VTPAUSE) the surviving lever pair, deferred to #131 remainder
+- **#112** [completed] CLOSED per plan: all four gate false-positive shapes fixed/excluded; survivor was #113's
+- **#113** [completed] CLOSED: exact per-TB stretch instrument + machine-wide user clock landed (cf8e04c8f4+ee5f9a0191); 52-cell wave 0 FAILs; load-invariance A/B proven — ADJUDICATION.md
+- **#114** [completed] RULED NO-ACTION (Q7): delivered artifacts are not formal releases — no sweep, no recapture obligation
+- **#115** [completed] FIXED (1765301a5d) + VERIFIED at tip: --disable-plugins builds clean
+- **#116** [completed] CLOSED (ff315644d4): R3 rip-out — 37 levers + 1 dead alias deleted (−1,471/+188, 14 files); -Werror clean, batteries green
+- **#117** [completed] DISPOSITIONED P3-with-numbers: stage-1 window closed without agentF freeze-stamp patches; bracket-edge leak ≤2.13 ms/window carried to Phase 3 (banked p1/freeze/patches/)
+- **#118** [completed] CLOSED per plan: device-state refutation stands; its Flag B itself refuted — act on neither
+- **#119** [completed] CLOSED per plan: recipe non-repro (0/121) on file; mooted by #147
+- **#120** [completed] CLOSED per plan: pure refutation, detector proven; retired to the livelock theory ledger
+- **#121** [completed] CLOSED per plan + P3 residual: machine-wide inclusion REFUTED; translation-billing transparency carries as P3 via #122
+- **#122** [pending] RESIDUAL: in-TB plugin callbacks are still charged to the guest clock
+- **#123** [completed] CLOSED per plan: JIT surface refuted at HEAD (verdict-11 verified)
+- **#124** [completed] DECIDED, NOT A DEFECT: the excursion omits the jump-cache clear on purpose, reason now in source
+- **#125** [completed] FIXED (2870ac3cc9): the containment may skip the eviction, not the count it changes
+- **#126** [completed] DECIDED, NOT REACHABLE: x86_update_hflags has zero TCG callers, so one hflags maintainer
+- **#127** [completed] CLOSED (20fbdaa638): July cross-tree rate ladder out of shipped docs; stall page documents exact-stretch accounting + interleave-only ruling + standing class rule
+- **#128** [completed] CLOSED (a651da6066): TWO upstream QEMU accounting defects fixed — drift 2403→0, sum|d| 4730→0, 1763 size_t counter WRAPS→0
+- **#129** [completed] DONE: RIP attribution closed the consequence loop; prefix statediff CLOSED H4 as an exclusion (61.2M boundaries, 0 leaks)
+- **#130** [completed] CLOSED per plan: false-zero-by-filter pattern on file (silent-false-success memory)
+- **#131** [completed] CLOSED: landed+certified through ab96872703; remainder 14b INFEASIBLE without a riscv64 guest-image build — carried as P3 harness debt
+- **#132** [pending] DELIVERED: multi-thread generative content oracle (mt_test) — follow-ups queued
+- **#133** [completed] REFUTED (not a plugin bug): plugin_cp_tail_dropped reds were a check naming the wrong mechanism
+- **#134** [completed] DONE (EXCLUSION UPHELD + causal proof): suppressed-delivery oracle — notify gate + PPR/ISR both clean, both WEDGE the guest when forced
+- **#135** [completed] DELETION HALF DONE (402ce9b7f4): plugin_spec_irq_dirty declaration removed; canon-net half re-scoped to #170
+- **#136** [pending] ISA survey at tip: 0/32 on all four (with caveats) + closure requirements per ISA + harness follow-ups
+- **#137** [completed] RESOLVED by Q8 round-2 ("LAND NOW"): rev3 endpoint identity + loud-refusal guard landed with the reduction; aarch64 SP-shadow regression caught+fixed at cf8e04c8f4
+- **#138** [completed] RE-MEASURED AND SPLIT: register half fixed for law-covered x86 by RECONSTRUCTION (623 iters byte-identical); R1 aarch64 MOPS / R2 SCAS FLAGS still carry END-state defect (→#174); clock half →#173
+- **#139** [pending] PLUGIN DEFECT: champsim_tracer crashes under record/replay — rr compatibility owed (icount = determinism/rr foundation, maintainer ruling)
+- **#140** [completed] #106 TIMEBASE JUMPS REAL (75/76 cells, 5-663ms); DILATION ACCOUNT REFUTED at its registered bar (3.4x not >=10x)
+- **#141** [completed] #106 TIMER SURFACE TESTED TO THE BOTTOM incl. BY INTERVENTION: freeze vindicated; edge-rearm fix ENGAGED yet stall UNAFFECTED
+- **#142** [completed] RULING: no fabricated events across ALL ISAs — edge re-arm is mandated correctness
+- **#143** [completed] FABRICATION FIXES LANDED: d977e4b2a5 (F1 edge kick re-arm) + 01b1d3e626 (F2 riscv WP-PMU) + db8e637719 (D2 overflow re-delivery) + 22a27cf721 (F3 TPR gate); D1 designed only
+- **#144** [completed] #106 SEPARATION ANSWERED (sepwave): stall follows the CLOCK DERIVATION exactly — N 0/12; P 12/12 flat; S post-fix 12/12
+- **#145** [completed] #106 table + basis audit DONE: only C1 (VIRTUAL consumption discipline) + C2 (u16.high edge pair) pass all arms; BASIS WRITERS HOLD at zero tolerance
+- **#146** [completed] #106 ICOUNT-FEATURE BISECTION + LOCUS WAVE DONE: deadline-consumption locus IS the surface, exclusivity required
+- **#147** [completed] #106 MECHANISM CLOSED + PRODUCTIZED: sole-consumer VIRTUAL evaluation at slice breakouts landed (34e55de9fc); stall wave 0/24
+- **#148** [completed] PHASE 1 CLOSED (PHASE1_REVERDICT.md at ff315644d4): every closeout row green; 252 commits PUSHED to origin/champsim-trace
+- **#149** [completed] Stage 1: productize breakout form in wt_prog
+- **#150** [completed] Rebuild all 4 softmmu targets in wt_prog, re-bank BIN_SHAS + vag_syms
+- **#151** [completed] Ladder step 1: x86 stall wave — 24 product + 6 icount reference, bar 0/24 + liveness
+- **#152** [completed] Ladder step 2: delivery-position check (prodw_delivery.py)
+- **#153** [completed] Ladder step 3: validator all 4 ISAs errors=0 on wt_prog build
+- **#154** [completed] Ladder step 4: mipsel D1 UART witness (d1wit_analyze.py)
+- **#155** [completed] Land stage 1 on champsim-trace (index-only, diagnostics stripped, patch-id verify, NO push)
+- **#156** [completed] Capstone x86_64: 24-cell kickcatch stall wave on wt_land (e57d01c938)
+- **#157** [completed] Capstone riscv64+mipsel: system validator batteries + loaded marker stall cells
+- **#158** [completed] Capstone aarch64: system battery + storm/poweroff arms + async-WINDOW residual count
+- **#159** [completed] Golden recapture at e57d01c938 (closeout step 2)
+- **#160** [completed] CLKEDGE EXECUTED per Q15 + all 7 contaminated rows re-proven MATCH on the clean build
+- **#161** [completed] ADJUDICATED: PHASE1_CAPSTONE.md at e57d01c938 — x86 wave GATE=GREEN 0/24; stall-gate FAILs 19→21/386, RED discharged into #113
+- **#162** [completed] LANDED 0be51eb312: bnd/repz prefix no longer publishes BRANCH_REP on branches
+- **#163** [completed] LANDED 7012240504: x86 access==0 fallback dest + boundary access for 6 Capstone-erased families
+- **#164** [completed] ADJUDICATED: FB bnd rows were Defect A's face; post-fix sweeps green on all gates
+- **#165** [completed] LANDED: Q8/Q9 rode the reduction series; Q3 delta reverted as superseded
+- **#166** [completed] LANDED: latch reduction series on champsim-trace (b6a76f51cc..51ecd23f90; 7a957ccccd replaced to purge a false P5600-scope justification)
+- **#167** [completed] CLOSED (9a3ddb2ba1): dead pin_probe slot deleted; asid_match renamed content_gate with its five fossil comment blocks corrected
+- **#168** [completed] DISCHARGED: Phase 1 closed → hold released; goldens recaptured + branch pushed (ab1f6d2b5b..ff315644d4)
+- **#169** [completed] CLOSED (e3812e5ca7+db6edc884f): x86_64 fields layer gated — and the sweep found 3 real Capstone defects
+- **#170** [completed] CLOSED (978b1767e4): system canon net now covers all four ISAs — determinism measured 20 boots each
+- **#171** [completed] CLOSED (396e54709c): #171 is a HARNESS defect — no memop value-annotation gap; two collateral tracer defects fixed
+- **#172** [completed] CLOSED (2aa3f77e09): guest-side randomness equalizer proven across both instruments; AT_RANDOM residual + re-pair NOT done
+- **#173** [completed] CLOSED (d6982a475c): surplus credited where the extra entry is published — clock_minus_wire=0 in both regimes
+- **#174** [completed] CLOSED (3205d7c1cc): option-B REP register contract — one write, on completion, both regimes; reconstruction deleted, R1+R2 dissolved
+- **#175** [completed] CLOSED (3cafb8e5fb): golden net extended to 28 cells — w8_repregs witnesses REP register contract, w9_tbflush retires unmeasured flush exclusion
+- **#176** [completed] CLOSED (23126c4286): withhold mirrored into both bill rows — every clock row BBV-identical across regimes
+- **#177** [completed] CLOSED (733a65dfb0): load-exclusive phantom store slot removed; store-exclusive half written, MEASURED, REVERTED — QEMU's cmpxchg genuinely delivers that load
+- **#178** [pending] CONFIRMED ON THE WIRE: no golden cell contains a TEST or an XADD of any form — the assertion still has no subject
+- **#179** [completed] STANDING RULING: no upstream PRs — every Capstone/QEMU defect fixed LOCALLY on the fork with guest-visible controls (EXTRQ acb8e9b3e0, MDMX 06c6cf6186, 0F C7 082a999443, nop alias f486209f, itrigger, sigbus...)
+- **#180** [completed] CLOSED (6159058897 + 6c7e62b826 + 9ffb127f20): aarch64 gate decided by a read PAN forbids; QEMU's debug walk was the outlier
+- **#181** [completed] CLOSED (545ace0cfc): honest baseline is 39 disagreements / 15 signatures, not 85/66
+- **#182** [pending] CORRECTED: the IR is not blind to x86 vector state — it reports OPAQUE on helper-implemented SSE, and oracle-ir.py mis-buckets that as disagreement
+- **#183** [completed] ARC 3 wiring done: irdf=1 lands, 2838/18, and the namespace bounds the arc
+- **#184** [completed] CLOSED for flags half (067ddc5ee8): jl's flags WRITE is the lazy-flag artifact and is gone — 134→0; retq/SS half folded into #265
+- **#185** [completed] PIN register gate live: cmov 2,132 = tracer right / PIN blind; endbr64 197 = OUR unset CET bit; capacity blind spot CLOSED
+- **#186** [completed] ARC 3 GROUND-TRUTH PROGRAMME: reference decoders x4 ISAs, coverage proof, QEMU-truth memops, intra-dep verdict
+- **#187** [completed] CP4 scoped to EIGHT functions: only 8 of 74 gvec constructors fold a same-register operand away
+- **#188** [completed] SUPERSEDED by ARC3_CLOSE.md §1 (per-fact per-ISA measurement replaced the hybrid verdict)
+- **#189** [completed] CLOSED (7e01f8c99f): CP-M part 2 — the ADDRESS half of the memop notes is consumed and on the wire
+- **#190** [completed] RESOLVED (ARC3_CLOSE.md §6.4): only arc3_cov/ and cst_runs/_arc3_cov exist — no arc3_coverage/ remains
+- **#191** [completed] CLOSED (ed6253eaf7): delay-slot class 1991→0; mipsel DISAGREE 1991→105, NO ISA flips
+- **#192** [completed] CLOSED (d3373f46a5): the six golden VALID rc=1 lines are TWO shared exit codes over THIRTEEN x86_64 oracle errors, all three mechanisms fixed at source
+- **#193** [completed] RESOLVED at source (ed6253eaf7): ctrl_one assert was MINE and the condition is REAL — an R6 compact branch emits its taken edge, defers not-taken; assert deleted
+- **#194** [completed] CLOSED (7c56b40da7): golden net names the guilty ISA; shared-baseline hole closed
+- **#195** [completed] CLOSED at AUDIT scope (542f0e5d1e): ctrl_syscall_ident fires 21/13/12/14, negative control proven; branch DISAGREE 0 ×4; WIRE flip is #205
+- **#196** [completed] CLOSED on the WIRE (fb92a61ea4): store_data_dep[] C→Q ×4 ISAs — REG_ZERO stated at QEMU's six operand accessors; 575 rows gone; dataflow ABI 2→3
+- **#197** [completed] CLOSED (0abed49f26): address masks index a QEMU-derived register list — J3 access-arm 88→0 ×4; set-content proven unchanged (48,374 sets)
+- **#198** [completed] CLOSED (32dc07225f): ABI tripwire proven BOTH ways — root cause was max_probes=2 SAMPLING; now probes all 62 configured emulators + standalone plugin_abi_gate.sh
+- **#199** [completed] CLOSED at AUDIT scope (2b17f63108+542f0e5d1e): 93 real folds adjudicated tracer-right; the OTHER 7 were OUR page-boundary defect in insn-ctrl, fixed at source
+- **#200** [completed] CLOSED (6d3f19167b): decode-on-demand landed as translate-and-keep — qemu_plugin_translate_at()/cpu_plugin_translate_tb(); Capstone consult DELETED from the path (0 ×4)
+- **#201** [completed] CLOSED (4a104e0be4): 708→0, address immediate-bit rule SETTLED with a firing witness
+- **#202** [completed] CLOSED on the WIRE (1e892799ed): admission half of J3 — max_dep_loads/stores are QEMU's; address families' vanished column IS 0 in all 24 cells
+- **#203** [completed] CLOSED (1e892799ed): store_data_dep relabels 8,739→75 ×4; the 75 are the env-field refusal fallback (→#218)
+- **#204** [completed] CLOSED — superseded: weak whole-trace coupling instrument replaced by per-encoding gate family (srcenc/opcenc/dstbar) + depmap R13 leg with measured ceilings
+- **#205** [completed] CLOSED (4a104e0be4): 708 RIP-relative slots → 0; note at gen_lea_modrm's fold both regimes; a FABRICATION HAZARD (shared A0 temp leaking REG_IP) found + closed; format.rst corrected
+- **#206** [completed] CLOSED (1e892799ed): per-access slot model through all 4 touch points — QDEP_R_MULTI dissolved; SETPROOF REAL-LOST=0; suppression 9,219→0
+- **#207** [completed] CLOSED (1e892799ed): family-2 offsets on the QEMU count; residual 75 = env-field refusal fallback; 7,833 vanish proven pre-existing floor
+- **#208** [completed] CLOSED (3118ab9ae4 + a82fcaddad + verify2): val_gate.sh adopted; deps-restricted coupling scorer measured on all four ISAs
+- **#209** [completed] CLOSED at 47bbdc2619 (PASS 10): the classification key is flipped on ALL FOUR ISAs
+- **#210** [completed] CLOSED: static_templates scope of damage EMPTY and PROVEN; refusals DISSOLVED with the wiring (a69a1d944c → 6d3f19167b)
+- **#211** [completed] CLOSED: build convergence restored (1,666 edges → 2); §6.5's stated cause was false
+- **#212** [completed] CLOSED — (pc,family) noise floor fixed in setproof; in-tree consolidation (c9d278d247) + relocation-aware floors (ee875eb502)
+- **#213** [completed] CLOSED with #314/#319 — AGREE-side floor was the same environment-sensitivity class
+- **#214** [completed] RE-OPENED ON MAGNITUDE at c9d278d247: build-to-build floor is 9 rows on a riscv64 refusal bucket; three-column form now shared tooling (#238)
+- **#215** [completed] CLOSED (c29da62564): audit scores BOTH wire and pre-refinement row; exposed two stale ARC3_CLOSE figures; refusal row witnessed via c.addi page-edge construction
+- **#216** [completed] CLOSED — identity payload no longer Capstone-joined: every identity row STATED from QEMU decode or VERIFIED (R20, QID_NONE=0 x4, STATED admitted 11e5509b76); LLVM side re-derived off QEMU names (f34ae2469b)
+- **#217** [completed] CLOSED — mooted: QID_SPLIT reads 0 on all four ISAs after the encoding-qualification program
+- **#218** [completed] CLOSED (7139a6317d): env-field provenance has its generic word — 173→1
+- **#219** [completed] CLOSED — superseded by the landed dst program: flip admission f5a5b2a33e, write-note b99a5eebdd, prov_stated e57081a67e, D5 frame 72ec010b12; dst bars 289,854 → ~1,190 non-x86
+- **#220** [completed] CLOSED — zero-register destination statements landed across ISAs (9fa9914421 mips/riscv; a64 sysl zero-dst; identity-move elision 5 sites)
+- **#221** [completed] CLOSED — destination-in-own-provenance class closed by one-class self-reload pass (cb26c3e774, 21,512 x86) + prov_stated + QC both-directions (edfb252029)
+- **#222** [completed] CLOSED as duplicate of #229; aarch64 census derives 945/947 bounded with 2 refusals
+- **#223** [completed] CLOSED — duplicate of #230 (8e56cc1290): callq return-address store-data dep names REG_IP on all 340 rows
+- **#224** [completed] CLOSED (f4ba63152d): validator dep-mask expectations pinned to retired src_reg[i] ordering; expectation language now accepts REG_* names
+- **#225** [completed] CLOSED by refutation (6f00eea6ed): src-prefix seating already in place; 5,688 "coordinate" rows are the DESTINATION list
+- **#226** [completed] CLOSED (7139a6317d): env offsets declared from CPUArchState via the compiler (insn_dataflow_declare_regfile); ABI 4→5; family-2 relabels 75→1; R_FIELD 173→1; REAL-LOST=0
+- **#227** [completed] MOSTLY CLOSED (6ffc682b35+87ded7a1dd): 7,277→3,139; 4,141 MISLABELLED; residue 787 + 2,352 →#243
+- **#228** [completed] LANDED WITH A STATED REGRESSION (73bbe638c0+2178272b38): ~97% of 7,491 GENUINE ACCUMULATES; SETPROOF REAL-LOST=15 (3 x86 rep stosq PCs), candidate fix INERT+reverted →#254, closes with #247
+- **#229** [pending] last two CP-H OPAQUE causes, 22 translations on 2 ISAs: get_cp_reg64's ri descriptor pointer (insn-dataflow.c:1492) + riscv csr predicate-function-pointer; OPAQUE=0 needs a NEW firing negative control
+- **#230** [completed] CLOSED (8e56cc1290): callq return-address store-data dep names REG_IP on all 340 rows; fixed at QEMU emitter; SETPROOF 341/0/0; validator PROVEN blind (checked=0)
+- **#231** [completed] CLOSED BY REFUTATION: mask WAS seated; 5,688+3,488 split was the INSTRUMENT (wrong key); real item = #232 (dst_regs[] LIST is the operand walk's)
+- **#232** [in_progress] dst walk: dst bar 289,854 → ~17,105 (x86 15,647 / mipsel 1,131 / rv 235 / a64 92); write-note + prov_stated + D5 frame landed; remaining x86 dst families + survivor table + loss gate — exec114
+- **#233** [completed] CLOSED by #237 (f262adc415): fnstcw publishes {REG_FPCW}; fpuc declared and fctrl carries REG_FPCW
+- **#234** [completed] CLOSED (c9d278d247): nodep_census.py is a standing acceptance row — the only instrument that can see a uniformly-false fact
+- **#235** [completed] CLOSED at source (c9d278d247): setproof.py refuses an empty comparison side — proven both ways on a planted arm
+- **#236** [completed] CLOSED (4227e75eca): R10.1 retreat exact — wire lands byte-where seating found it; 207 of 209 mipsel rows were DELAY SLOTS
+- **#237** [completed] CLOSED (f262adc415): x87/SSE control file generic words via generator; SETPROOF CHANGED=1 (fnstcw datum is fpuc ALONE); a REG_NONE-passes-every-test defect caught by own SETPROOF + fixed
+- **#238** [completed] CLOSED (c9d278d247): vacuity guard at source proven both ways; ALL past SETPROOFs re-checked; 42 selftest checks, 25 superseded copies deleted; all 39 zero-row arms are the mnem CONTROL →#244
+- **#239** [completed] CLOSED — superseded by #246 (28 survivors TRACER-RIGHT) + four CP-H helper censuses dissolving helper opacity as a class
+- **#240** [pending] mipsel CP0_UserLocal/Config5 lack GDB rows — UNBLOCKED (csr_ops precedent + a64 declare_regfile source); mipsel needs the same one-file extension
+- **#241** [completed] CLOSED — lladdr settled by R7.7 (no reservation-state register; 07dbb48314); error_code rides the 'lowering' census outcome (391e65d07f)
+- **#242** [completed] CLOSED by #247 (685914abf2): decide_block() owns HAS_REG; HAS_ADDR half closed by #262/#264 (99531d88a6)
+- **#243** [completed] CLOSED — subsumed by #248 encoded-immediate provenance (e3a693f357+) + dst-bar program; residues →#251/#253/#255
+- **#244** [completed] CLOSED by #249 (af0c90c7d7 + e74f09b751): dstmask is the destination family's live control, LIVE 4/4
+- **#245** [completed] CLOSED by 391e65d07f: mipsel btarget is QEMU's delay-slot carry temp, classified under 'lowering' census outcome with translate.c line (R16)
+- **#246** [completed] CLOSED (749579ea65): helper writes 98→28, x86 67→0; 28 survivors ALL TRACER-RIGHT (mul HI/LO UNPREDICTABLE, or-$zero, CP0-during-delivery, 4 MOPS); flip held
+- **#247** [completed] LANDED (685914abf2): block existence decided by QEMU's stated facts, Capstone input deleted; REAL-GAIN=76,190, REAL-LOST=0; survivors named (98 x86 + 2 mipsel); residue HAS_ADDR = #262
+- **#248** [completed] CLOSED (e3a693f357+a903abbaad+9bd491fb4a): encoded-immediate provenance stated at all four decoders; 2,361→70; riscv li rd,imm publishes {REG_ZERO,IMM}; residues #251/#252/#253
+- **#249** [completed] CLOSED (af0c90c7d7 + e74f09b751): dst family has a LIVE J3 control on 4/4 ISAs; zeros NOT uniform
+- **#250** [completed] CLOSED (5664563443): R11 REG_IP → REG_PC, value 252 unchanged, grep proof 0 survivors; FCSR reported same defect
+- **#251** [pending] encoded-immediate ABSTAIN direction now has 14 subjects on x86_64 (2178272b38); zero survives only on aarch64/riscv64/mipsel
+- **#252** [completed] CLOSED (869dcc0369): the value-stating note exists, both roles, trap code adjudicated NOT a dataflow operand
+- **#253** [pending] OPEN (from #248): 31 rows where the decoder stated its immediate and QEMU folded the value away before any op read it
+- **#254** [completed] CLOSED by 99531d88a6 (#264): the 3 rep stosq PCs' whole dep block restored — REAL-LOST=0 x4 vs TRUE pre-carrier baseline
+- **#255** [pending] Immediate-rule residues: #252 CLOSED; remaining #251 (14 x86 abstain) + #253 (31 pre-op folds) — close with constructed-cell pass or refuse-as-contract
+- **#256** [completed] CLOSED by 99531d88a6: R12.1 satisfied without discount — REAL-LOST=0 x4; no "pessimistic direction" rationalisation
+- **#257** [completed] CLOSED — superseded by destination bar machinery (PUBD+WSTQ columns a33ec14f48/2cf1013d56, dstbar.py 14a20395b5 + 720553da6a)
+- **#258** [completed] CLOSED (98eb894d87): R7.6 exception-delivery write set — mipsel #218 25→5
+- **#259** [completed] CLOSED (e79a6f6a73): the #236 flip's refuse route is BUILT and COUNTED — 0/6/0/0, not taken
+- **#260** [completed] CLOSED — 'written-and-discarded' primitive landed as zero-dst write notes (a64 sysl/cmp cb6011052a; mipsel 9fa9914421); a64 dst residue 90 named
+- **#261** [pending] OPEN (R10.1 adjudication): riscv64 and mipsel carry NO architectural REG_PC destination at all — R10's consumer rationale delivers nothing on 3 of 4 ISAs
+- **#262** [completed] CLOSED by 99531d88a6 (#264): HAS_ADDR existence is decide_block()'s on the R12 rule; dropped address back on the wire
+- **#263** [completed] CLOSED (ece26f3b8e): census gate reads BOTH row shapes — 28 of 30 was a FALSE green, the 134 now visible and RED
+- **#264** [completed] CLOSED (99531d88a6+09636d1960): per-ACCESS address verdicts — real mechanism was qdep's own whole-family refusal; rep stosq depflags=0x03; REAL-LOST=0 x4; spec sentence corrected
+- **#265** [completed] CLOSED (ece26f3b8e+067ddc5ee8): must-0 scanner reads both row shapes; cc 134→0 with zero flags-sources lost; 8 inc/dec/bts/bt re-adjudicated R7.1 lazy-flag artifacts; #184 closes; survivor #266
+- **#266** [completed] CLOSED (b13b9ff3ab): trapping-arithmetic write set on the wire; w3_coverage green
+- **#267** [completed] CLOSED via route (b) (869dcc0369 + b13b9ff3ab): the blocker was #252 and it is gone
+- **#268** [completed] #267 COSTED, NOT CLOSED: (a) list flip = 386 wire-right destinations lost; (b) boundary row BLOCKED on #252; tree reverted to 93765e90a9
+- **#269** [completed] CLOSED — mipsel FP-pair class got its structural rule (ada9353495 FR=0 makes the pair one register); gem5wp/mipsel at 8 under its ceiling of 10
+- **#270** [completed] CLOSED — mutation-control class rebuilt across four sibling controls (9301194af2+53b4b9e5fc); ALL-FIRED-while-one-didn't shape impossible by construction
+- **#271** [completed] CLOSED at 80b15ca633 (681f21e26f): disasm body renderer prints the sourceless read set — PIN criterion 42,149→289
+- **#272** [completed] CLOSED (exec32/pinaxis): ~1,000-row PIN value movement 100% benign (INHERITED-DIFFERING-INPUT/ORTHOGONAL on flags); memcheck_self VIOLATED 1→0 via syscall-boundary fix (f8dfd99868)
+- **#273** [completed] DONE: exec31/R13_VERDICT.md — reference x ISA x fact class, every wrong-VALUE row; verdict YES-with-four-exceptions
+- **#274** [completed] DONE (f85ee00ccc): tools/external_truth_gate.sh + manifest + scorer + README; GATE PASSED over exec31; selftest 3 arms
+- **#275** [completed] DONE: ARC3_CLOSE.md "EXECUTION PASS 11"; §6.5 REWRITTEN (both claims refuted); arc-remainder 17 rows with R13
+- **#276** [completed] DONE: STATUS.md pointer (EXEC31/R13) + exec31/DIGEST.md, findings first
+- **#277** [completed] CLOSED (050283a3f1): option (a) landed — folded FIELD publishes its CONTAINER's value; Spike VALUE-MISMATCH → 0
+- **#278** [completed] CLOSED at source (ceb34d36ba), re-verified WITH A FIRING CONTROL at 80b15ca633; filed scope wrong — DEFAULT arm carried it too
+- **#279** [completed] HARNESS DEFECT (R13): two instruments disagree on reachability for 10 x86_64 UNACCOUNTED rows; weaker one is "qemu_tcg_reachable"
+- **#280** [pending] HARNESS DEFECT (R13): gem5_env.py's stated SIGSEGV justification does not reproduce against the gem5 binary on this host — libpython half load-bearing, libstdc++ not
+- **#281** [completed] CLOSED (ccfaf4fdc5 + dc346afb62): qemu-user x86_64 SYSCALL clobbers RCX and R11; PIN criterion 289→268, rcx row 13→0
+- **#282** [pending] #277b OPEN, EPOCH ITEM: a folded register ID has no member discriminator, so one wire name still carries two registers
+- **#283** [pending] #277c OPEN: under the composed-register contract a field write reads its container, so REG_FCSR is arguably a SOURCE of csrw fflags
+- **#284** [completed] DONE (PASS 12): 8 of 12 R13 legs re-run at 80b15ca633 ALL PASS; 4 static rows un-refreshable (#286)
+- **#285** [completed] DONE (PASS 12): FULL battery green at 80b15ca633 except known #266; SETPROOF REAL-LOST=0 vs TRUE baseline
+- **#286** [completed] #286 HARNESS DEFECT (PASS 12): the four static R13 gate rows cannot be regenerated on this host — 4 of 12 legs un-greenable after any rebuild
+- **#287** [completed] #287 (sharpens #279): qemu_tcg_reachable column not repeatable — 30 verdicts flip run-to-run against a byte-identical matrix
+- **#288** [completed] CLOSED (9070200114): carrier was cc_srcT, a TEMP — gem5-X86 WP UNACCOUNTED 15→0; 11 PIN cmov/sbb SUPERSET rows retired
+- **#289** [completed] CLOSED — PIN leg's TRACER-SUPERSET blindness ended with fold repair (0c5c18171b); extrasrc negative control FIRES (260→259)
+- **#290** [pending] #290 OPEN (3c2f456d07): identity audit's aarch64 branch zero is CORRECT-PATH-ONLY — udf has no adjudication rule
+- **#291** [completed] #284/#285 PASS 13 equivalents: 13 of 13 R13 legs at one tip ALL PASS; full battery + SETPROOF re-measured
+- **#292** [completed] CLOSED AT SOURCE (cd28220db7+07de29d42b): the staleness reference is a BEHAVIOUR time, not a link time
+- **#293** [completed] CLOSED (b0c3e14f07): the syscall rules now TEST the clobber; criterion 265→261, ceiling re-derived
+- **#294** [completed] CLOSED AT SOURCE (175e1f52f5): the spread was the OUTPUT DIRECTORY — AT_EXECFN's length moves the guest stack
+- **#295** [completed] exec34/verify: FULL battery at tip c4c8236483
+- **#296** [completed] exec34/verify: COMPLETE 13-leg R13 gate at the tip
+- **#297** [completed] exec34/verify: SETPROOF three-column vs TRUE baseline
+- **#298** [completed] ARC-REMAINDER: enumerate EVERY Capstone consumer on correctness paths
+- **#299** [completed] Write ARC3_CLOSE PASS 14 + STATUS.md + exec34/DIGEST.md; audit RULINGS.md
+- **#300** [pending] #295 NEW (cosmetic): 4 stale qemu-system-mipsel.* experiment binaries inflate the caplinks 66
+- **#301** [completed] #301 RESOLVED WITH #294: the 265..277 span was the output directory's path length
+- **#302** [pending] #302 OPEN: 27 x86_64 shift-by-immediate rows still refuse on the unstated-path word
+- **#303** [completed] CLOSED — #252 (value-stating note + trap-code adjudication) landed at 869dcc0369; cmeq refutation recorded in #252
+- **#304** [pending] #304 OPEN (same mechanism as #294): the PIN MEMOP arm still lets the output directory move the guest stack
+- **#305** [completed] #305 CLOSED (cd28220db7): the selftest's default fixture moves with the ceilings, and the rule is written down
+- **#306** [completed] CLOSED — setproof in-tree with relocation-aware join, coverage floors that REFUSE, 31-arm selftest (ee875eb502)
+- **#307** [completed] PASS 15 DONE: completion-bar verdict at b0c3e14f07 — consult count ONE per ISA; bar NOT met
+- **#308** [pending] MOPS syndrome coverage: cpyfe/cpyfm/sete/setm destination registers stated at QEMU's syndrome decode
+- **#309** [completed] CLOSED — superseded: SOURCE flip LANDED 94dc9e649c (#328), DESTINATION admission f5a5b2a33e (#232)
+- **#310** [completed] SUPERSEDED by the clean restart — R14 total removal executes as CLEAN_PLAN.md's series (one flip, one deletion)
+- **#311** [completed] CLOSED — three flip obligations discharged: dst seating documented with lane mask 0 (f5a5b2a33e); format.rst refused-family/one-direction + D5 + push carve-out; #266/#267 still-closed
+- **#312** [completed] CLOSED — superseded by standing verification set: 19-leg R13 gate + 36-row battery run every pass
+- **#313** [completed] #313 CLOSED AT SOURCE (df3b045755+a33cc8ffda): an empty trace is now refused by both acceptance tools
+- **#314** [completed] CLOSED — consult-count environment sensitivity ATTRIBUTED (exec113 R14_ATTRIBUTION): count equals translated-instructions-read; class is environment not commits
+- **#315** [completed] CLOSED — stale-quoted-figure class corrected by #215; every wire-affecting pass re-quotes opcode DISAGREE fresh per ISA
+- **#316** [completed] PASS 16 DONE: R14 verdict at 8c1d2ae80f — NOT MET, all three forms RED
+- **#317** [pending] #317 folded into R14 endgame (#310): the second admission gate is one of the 2-3 gate sites; both move together in the deletion commit
+- **#318** [completed] PASS 19 DONE: R14 re-measured at 81139577bd — NOT MET; superset half holds; R13 13/13 green
+- **#319** [completed] CLOSED with #314 — DECIDED-column sensitivity is the same environment class (exec113); SURVIVOR columns insensitive throughout
+- **#320** [completed] PASS 20 DONE: R14 at 36a34a28a9 — NOT MET; superset holds; R13 13/13 green
+- **#321** [completed] CLOSED — no-op build floor re-measured (175 edges + 2 version-header regens); settle rule (FULL ninja x2) standing doctrine
+- **#322** [completed] PASS 22 DONE at cb9b087a31: R14 all three forms RED; source census 7,895 → 2,006
+- **#323** [completed] #323 CLOSED (cb9b087a31) + #324 RECORDED: my own tripwire was blind, and I destroyed most of a bank
+- **#324** [completed] PASS 23 DONE at 5fcd27a08d: R14 all three forms RED; everything else green; tripwire UNCHANGED
+- **#325** [completed] CLOSED — PASS 24 status row; cwd/PATHLEN sensitivity became standing discipline (matched-length stamps)
+- **#326** [completed] CLOSED — EXEC46 status: OPC_ADDU stale-object diagnosis + first survivor table; superseded by regenerated 51-row table (ENC roles, refusals 1-8)
+- **#327** [completed] EXEC47: refusal route HAS a subject (cpuid/msr tpidr_el0); dump X-line landed 8bc4170c40, census hoist BANKED RED
+- **#328** [completed] CLOSED: THE FLIP LANDED (94dc9e649c) — wire src lists are QEMU's + survivors; 782 gains / 0 losses, 13/13 external legs
+- **#329** [completed] SUPERSEDED by the clean restart — J7 deletion's knowledge feeds CLEAN_PLAN.md; demolition-era execution path closed
+- **#330** [completed] CLOSED — survivor machinery rebuilt end-to-end (snapshot-disciplined generator, refusals 1-8, ENC roles, byte-identical regeneration)
+- **#331** [completed] #331 CLOSED: R20 statements landed ALL FOUR ISAs (QID_NONE 0 x4, 6,570 rows); 20 wp16 losses closed (a76f8026d6+9eb33ccb5b); 12 live SVE survivor-row fabrications now stated by QEMU
+- **#332** [completed] CLOSED — vocabulary has second sources on every ISA (riscv csr_ops 371 e27aa69cc9; aarch64 declare_regfile 118→131 1c63ca09b1; mipsel MSA ENC 2727c81e05); lowering temps a LABELED census outcome (391e65d07f)
+- **#333** [completed] #333 CLOSED: QID_STATED admitted at runtime (11e5509b76, incl. PACIASP/AUTIASP); enum-abstain fallback killed (02a18075c9); enum residue 1,415→18 (decode_id=0 hlt/udf)
+- **#334** [completed] Coverage arc: PASS 89 VERIFIED at 8aea7f9a2f — gate 19/19, both bars BLOCKED-FREE
+- **#335** [completed] 87-C CLOSED: four dead dest classes retired, destination ledger rc=0
+- **#336** [completed] 87-D/87-E BOTH REFUTED as filed; the real mechanism was the LEDGER, now has a detector
+- **#337** [completed] PASS 88 DONE at 8aea7f9a2f: BOTH BARS BLOCKED-FREE; src 5,181→4,814; dst 2,452→1,884
+- **#338** [completed] PASS 89 independent verification at 8aea7f9a2f (verify66)
+- **#339** [completed] 89-A/89-B DISCHARGED at 056ba4a202 (legcheck C1/C2/C3); residue re-filed as 90-A/90-B (exec150 wave)
+- **#340** [completed] PASS 91 independent verification at e3abdefb88 (verify68)
+- **#341** [completed] exec153 LANDED 5d9154d8c2 + 0b34b2e446: enum cause (b) FIXED at x86 source; 91-A/B/C discharged; census UNMOVED at 86/11
+- **#342** [pending] HARNESS/RECORD: golden net NOT a byte-identity oracle at this tip — 42 mismatches AT BASE, reference 1b38609884 (2026-08-22)
+- **#343** [completed] exec154 Fields wave: retire the 86 Capstone field reads, then the gates/consult/import
+- **#344** [completed] exec158: poison-gate flip COSTED BOTH SIDES and HELD on 93-A — srcenc gate needs a REFUSED-BY-ADMISSION category first
+- **#345** [completed] PASS 92 independent verification at a76ce17b2f (verify69)
+- **#346** [completed] 92-A CLOSED at b947808d89 — cause REFUTED (stale shipped identity header); stale-header detector proven both ways; gate 20/20
+- **#347** [completed] 92-C CLOSED at 8b6d583f4b — srcenc_sled stamps #so, gate refuses mismatched/unstamped corpora (18 selftest checks); residue 93-D
+- **#348** [completed] PASS 93 verify DONE at b947808d89 (verify70): gate 20/20 x2; FINDING 93-B = 5,544+593 unadjudicated CPL0 x86 bar registers (exec158 lead)
+- **#349** [completed] 94-A DISCHARGED — join exists, selftested, adjudicated the flip's survivors; flip landed at 2ff695368a; follow-on 96-C retirement
+- **#350** [completed] exec159 PASS 94: close QEMU-STATES-IT ledger row 46→23 (vsetvl) + file WFET/zext.w
+- **#351** [completed] 95-A CLOSED (f244d1754c): one scoping predicate — ambiguous family credits neither class; barscore 9/9
+- **#352** [completed] 94-A CLOSED (154c3e534a + 1a272dbaa3): per-SIGNATURE refusal join; 8-arm selftest; 6 stamped refusals; fired on real aarch64 data
+- **#353** [completed] THE FLIP LANDED (2ff695368a): block admission on qemu_plugin_insn_undecoded; 407,171 corpus rows removed; x86 60,171/60,171 attributed; gate 20/20; residues 96-B/96-C
+- **#354** [completed] D14/#290 CLOSED (7b23579707, verified 3f11049dc5): 0 udf rows in aarch64 corpus; 00000000 REFUSED; ROUTE documented not-empty in limitations.rst
+- **#355** [completed] The mipsel 14 CLOSED (3a40460c85): one mechanism, measured, remedy landed at five arms with whole-population legs
+- **#356** [completed] PASS 97 VERIFIED at 3f11049dc5 (verify73): R14 NOT MET; gate 20/20 TWICE; closeout list 5→3
+- **#357** [completed] 97-A CLOSED (fcf8f88bd5): the assembler is IN TREE and carries all three silence tokens
+- **#358** [completed] 97-B CLOSED (0e4df18264): grammar widened + roll-up asserts against the instrument's own count
+- **#359** [completed] 97-C CLOSED (f97e07e94d): the stamp says GENERATED AGAINST and why it is one commit early
+- **#360** [completed] 98-A CLOSED by measurement: the zero-register row is 940, and 15→1 is refuted
+- **#361** [completed] 98-B CLOSED: the #so stamp now carries plugin AND emulator, verified live
+- **#362** [completed] exec167 DONE: mipsel enum-table occupancy 94,704 → 0 at 290215f0d8
+- **#363** [completed] PASS 98 FINAL INDEPENDENT VERIFICATION at 290215f0d8 (verify74)
+- **#364** [completed] PASS 98 FINAL INDEPENDENT VERIFICATION at 704718b782 (verify75) — post-deletion
+- **#365** [in_progress] 98-F ATTRIBUTED + BISECTED to 2fdabefe79 + FIXED at source (1291bba8ab, 49b2348d22, 93cf8d1892); 8 legs re-run, 6 at ceiling, 2 RED on allowlist re-derivation (46 dead / 98 unallowed)
+- **#366** [pending] 98-G: 96-B survived the enum-table deletion unchanged — the prediction that removes it is refuted
+- **#367** [completed] 98-D CLOSED + WIDENED (153fa96e45): the retirement also broke the docs BUILD, and nobody had looked
+- **#368** [completed] R14 deletion PRICED and BLOCKED (exec171): the Capstone operand walk is load-bearing on the wire
+- **#369** [pending] NEXT WAVE LEAD: split the 540,798 encoding-level Capstone-only sources into REAL vs SUPERSET
+- **#370** [pending] PASS 99 INDEPENDENT VERIFICATION at 153fa96e45 (verify76)
+- **#371** [completed] exec173 LANDED d50843d1b3 + 322bcda8ff + efd578b3a2: 99-F fixed in one shared reader; 86 unallowed signatures NOT allowlist debt (mipsel 76,567 on coprocessor/ASE rules); DEAD_46.txt; retirement + mipsel branch-taxonomy fix OWED
+- **#372** [completed] PASS 100 INDEPENDENT VERIFICATION at 4eb81d806e (verify77)
+- **#373** [completed] exec176-1 DONE (c0e64b09d2): exec173's 76,567 REFUTED — defect is 168 rows on OPC_PMON + OPC_SHLL_QB_DSP; whole-pop A/B; 12 external legs NOT run, owed
+- **#374** [completed] exec176-2 DONE (9d6947fd02 + 11c7289fde): isaxunallowed 98→9 (under ceiling 12) — mipsel 82→0, riscv 2→0, x86 8 named
+- **#375** [pending] exec176-3 NOT DONE: 46 dead rules stand (a64 7, mipsel 1 cachee, riscv 12, x86 26); per-row probe demonstrated; isaxdead srcenc stays RED
+- **#376** [pending] exec176-4 HALF: 99-B CLOSED (189c9352f6 + 9376ced7a1 — live population 297, UNCITED 0); 99-C NOT DONE (rv table no qemu_tcg_reachable column; ctz LIVE / vadd.vv INERT)
+- **#377** [completed] exec177-1 DONE (8c6c1970c2 + 616416253b): x86 arm BUILT (objdump-offset + llvm cross-check); 4 buckets REAL-OPERAND, 0 superset; NOT-NAMED residue = implicit-operand class
+- **#378** [completed] exec177-2 DONE: mips-acc CONFIRMED REAL (#228 accumulate, 6,708 DATAPATH, $ac named); a64-sys + a64-fpctrl both REFUTED (EC 0x00 unallocated; fmopa trap before fpstatus_ptr())
+- **#379** [pending] exec177-3 NOT LANDED: VOCAB-GAP 63,232 refuted to 0 (ZA read is a trap); QEMU-ELIDES 128,819→95,375; wire change (mipsel $zero + mips-acc $ac) not attempted
+- **#380** [pending] 177-A: no ASE-ENABLED sweep exists — 493,576 TRAP-STATE instances cannot move to REAL/SUPERSET without one
+- **#381** [pending] verify78: independent verification at 9722718566
+- **#382** [pending] exec179 wave: legs, 101-A, 101-B, x86 static ceiling
+- **#383** [in_progress] exec180 wave: the 46 dead-rule retirement, 99-C rv reachability, #379 statement batch, 177-A ASE design
+- **#384** [completed] STATEMENT PHASE DONE at 91c74ade8d: REAL-LOST=0 x4 (R12.1 MET) — ladder 8,382→0 via D17 trap-state ruling + statements b238402fa1; BAR PASS rc=0
+- **#385** [in_progress] exec182 DELETION PHASE: retire the Capstone operand walk, R14 to zero
+- **#386** [completed] exec183: R14 endgame — REAL-LOST 3,611 → 0, then the deletion
+- **#387** [completed] exec189: the three statements + the rep adjudication, then the WRITE-ARM deletion
+- **#388** [completed] exec190 DONE at bd2848c450: 189-A closed; 43 mipsel dst families adjudicated by intervention (11,896/11,896 TRAP-ONLY); WRITE ARM LANDED (REAL-LOST=0, validator 4/4 x12); R14 NOT MET — blocker = 8 Capstone fields at 67 sites across 5 wire-bearing arms; FINDING 190-A
+- **#389** [pending] exec192: combined 20-leg run at 5a9a9bc572, then lane-shape + synthetic-EA statement programs
+- **#390** [pending] exec195: 192-B bisect+adjudicate, 192-A srcenc re-point, full 20 at tip
+- **#391** [in_progress] THE CLEAN SERIES (CLEAN_PLAN.md, approved): 6-step contract — hooks from QEMU emulation paths, ≤300-line vocabulary table, missing details filled (EA etc.), multi-source validation with ARBITRATED disagreements, one flip + one deletion
+- **#392** [pending] B-series next: the words at the decode sites, riscv64 and aarch64 first
+- **#393** [pending] B1+B4: identity and words at the x86 and MIPS hand-decoder sites
+- **#394** [completed] exec205 F1 ACCEPTANCE at a5c9858df7 — verify, never fix
+- **#395** [completed] exec206 B1-second-half DONE at 6d3d0140f3: x86_64's five decoder-only statement classes landed with firing negative controls
+- **#396** [completed] exec206 B2-second-half DONE at d119e2304b: aarch64's decoder-only statements landed with firing negative controls
+- **#397** [completed] exec206 B3-second-half: riscv64's decoder-only statements
+- **#398** [completed] exec206 1-A TRIAGE DONE at b6bb298e9c: 12/12 triaged, 3 CARRIED, 9 RE-LANDED FRESH; golden span-pairing GREEN 25 cells; validator 4/4; REP witness firing
+- **#399** [pending] 206-A OPEN: QEMU's store-exclusive cmpxchg performs a REAL load, so the wire shows an RMW for a write-only instruction — D1 does NOT close it
+- **#400** [pending] 1-A OWED: re-measure the two upstream-QEMU re-lands at this tree (cputlb n_used_entries drift; aarch64 PAN one-in-sixteen truncation) — numbers are demolition-era
+- **#401** [pending] 206-B: the golden net has NO SUBJECT for the REP register contract — w8_repregs was apparatus in the dropped range; net back to 25 cells
+- **#402** [completed] exec208 DONE at a9d1393cdc: 207-B CLOSED — lane KIND + SELECTOR stated by QEMU on all four targets
+- **#403** [completed] exec208 selfloop DONE at 831a359921: 207-C CLOSED — the self-loop fan-out unit is stated by QEMU
+- **#404** [pending] 208-C OPEN: x86 INS states unit 2 (QEMU's two stores) against Capstone's 1, with no witness
+- **#405** [completed] exec209: D1 NOT LANDED; fact census says unblocked on facts and not one commit; one upstream gen_tb defect fixed at 6fa9f13565
+- **#406** [completed] 209-A CLOSED (3b951fcc9c): CST_DF_SET_DUMP is the per-encoding register-set corpus; exec210 §3.3 used it for REAL-LOST on names
+- **#407** [completed] 209-B CLOSED (fbef1bcff5): codegen moved inside cpu_plugin_exec_inline's own landing pad; entry point kept (published ABI)
+- **#408** [completed] 209-C CLOSED (c9a81361c7): CST_ALIAS_DUMP + aliasscore.py score the alias surface whole-population x4; REFUTE census riscv64 claim → 210-E
+- **#409** [completed] exec208/f1final: F1 FINAL ACCEPTANCE at 6fa9f13565 — verify, never fix
+- **#410** [pending] 210-E OPEN: riscv64's alias refiner is the ONLY separator of j from jal rd on 3,962 encodings — the census's rows 2/13 argument is refuted there
+- **#411** [pending] F-2 CLOSED (882818a146): stale-arbitration verdict keyed on the build's rule universe, not the sample — PASS 0 UNRULED / 0 DEAD x4
+- **#412** [pending] 209-A COMPLETED (c9a81361c7): CST_GEN_SET_DUMP states BOTH decoders' sets in the wire's currency; setjoin.py gives D1's REAL-LOST bar its subject
+- **#413** [completed] exec210-D1 LANDED (cbce32bb36 + 707d697b37): THE FLIP is on the wire; REAL-LOST NOT 0 — x86 syscall loses RCX/R11/EFLAGS
+- **#414** [pending] 210-H OPEN: aarch64/riscv64 register-offset loads name their own DESTINATION as a source — a fabricated RAW edge, mechanism unattributed
+- **#415** [pending] 210-G OWED (the one REAL LOSS at the D1 tip): x86_64 syscall drops RCX/R11/EFLAGS — state the user-mode clobber at target/i386's SYSCALL emitter
+- **#416** [pending] 210-I/210-J/210-K: a validator fallback defect, QEMU's cross-target PC-read inconsistency, and E1's re-home item (generic-id → GDB-key reverse index)
+- **#417** [pending] 210-L: the four D1-tip bars that did NOT run — R13 20-leg, §3a golden pairing, gap-report join, capture-segregation identity, whole-population REAL-LOST
+- **#418** [completed] exec210 F1 FINAL ACCEPTANCE DONE at d1ab3d26db — NOT PUSH-READY
+- **#419** [completed] exec212 DONE at dad5109d59: THE EXTERNAL REFEREE IS BUILT — join non-vacuous x4 (x86 211,512 keys); port PROVEN 0-differing; gapreport LIVE 0 DEAD x4 but 8 UNRULED (212-B)
+- **#420** [pending] 212-B OPEN: 8 NEW unruled gapreport classes (riscv64 2, mipsel 6) — each needs its own merits read
+- **#421** [pending] 212-A OPEN: referee's key set is a strict superset of the retired in-process arm's (x86 4 / a64 7 / rv 59 / mipsel 166), mechanism unfound
+- **#422** [completed] exec213 DONE at cc49deb501: (b) regdata width-0 CLOSED 43/43→0 via generated gdbstub table; (a) partly REFUTED as a regression; (c) attributed not fixed
+- **#423** [pending] exec214 STOPPED at E1's precondition: deep-flag bar RED at BASE (1,111 uncapped errors), external REAL-LOST has no reading at this tip
+- **#424** [completed] exec215 F1 FINAL ACCEPTANCE DONE at cc49deb501 — NOT PUSH-READY; R12.1 measured and NOT MET
+- **#425** [pending] 215-A/215-B/215-C: R12.1 not met with a number, zero R13 legs in the series, balance +16,622
+- **#426** [pending] exec216-1: 214-B/213-D/213-C harness pass
+- **#427** [pending] exec216-2: 213-B identity-move elision zero-dst write note
+- **#428** [pending] exec216-3: x86 lazy-flag fabricated REG_FLAGS destination
+- **#429** [pending] exec216-4: 214-C call_return_store re-land
+- **#430** [pending] exec216-5: static_reg_sets remainder on the population
+- **#431** [pending] exec216-6: bars — validator x4 deep flags, 3a pairing, builds, 4a rows
+- **#432** [completed] exec217-1 CLOSED (6bea03ef5f): 212-B — the 8 gapreport classes, one merits read each; PASS 0 UNRULED / 0 DEAD x4
+- **#433** [completed] exec217-2 CLOSED (e3454cb187): setjoin_rulings.tsv + setjoin --require-ruled, keyed (isa,name,DIRECTION), 17/17 selftest arms
+- **#434** [pending] exec217-3 PARTIAL: 215-A read 157/213 classes (58,710/59,373 rows); 56 classes / 663 rows UNRULED and named
+- **#435** [pending] exec217-4: bars at e3454cb187 — gapreport PASS x4, setjoin FAIL (1 of 4 ISAs clean), builds+validator green, no 3a owed
+- **#436** [pending] exec219 F1 FINAL ACCEPTANCE DONE at e3454cb187 — NOT PUSH-READY; E1 did not land, balance +17,523
+- **#437** [pending] 219-A/219-B: the gapreport and setjoin bars are CORPUS-SENSITIVE — two passes' green was a sampling artefact
+- **#438** [pending] 219-C/219-D/219-E: three record corrections — R13 legs STALE not MISSING, cs_riscv_* residue STANDS, R13 selftest is rc=1
+- **#439** [pending] 219-F: the golden bank has NO re-baseline account for the D1 wire flip — the net is not an oracle until one is written
+- **#440** [completed] exec220 DONE at 22cf161b5f: 220-A — 10,631-row zero-register REAL-LOST class was the SCORER'S OWN SPELLING (@atom0 vs REG_ZERO); 5 ruled QEMU defects fixed; 220-B FILED (~7,600-row vector class wrong comparand); R12.1 NOT MET; R13 legs OWED
+- **#441** [completed] exec221 DONE at 7b9827fdff: last in-process comparand retired; both scorer bars PASS on stamped fresh corpora; deep-flag 174→42, NOT green
+- **#442** [completed] exec225: the three external-truth wire classes (PC-as-branch-input, gem5/Spike dep edges, deep-flag tail)
+- **#443** [completed] exec226 DONE at 40b5bc0638: E1 precondition RED on 2 of 3 rows — deletion STOPPED, nothing touched
+- **#444** [completed] exec228: close the deletion precondition remainder
+- **#445** [completed] exec229 STOPPED at the precondition, re-measured at BASE 6b8c9dbde4: 2 of 3 rows RED; deletion NOT started; findings 229-A/B/C
+- **#446** [pending] exec230 F1 FINAL ACCEPTANCE at 6b8c9dbde4 — verify, never fix
+- **#447** [completed] exec232 STOPPED at the gate, re-measured at BASE 699666239f: 2 of 3 rows RED
+- **#448** [completed] exec233 F1 FINAL ACCEPTANCE DONE at 699666239f — NOT PUSH-READY; no re-bank taken
+- **#449** [completed] exec234 DONE at fc9f70562d: table fallback NOT dead (122 live register routes); re-homed to 49, wire-neutral; BAR NOT MET — 49 survivors SVE+RVV, no XML to join; finding 234-A (cap_arch/cap_mode_for_target retire FIRST)
+- **#450** [completed] exec235 DONE at 89cb63014d: E1 precondition CLOSED 49→0, wire-neutral; deletion NOT started (blocker 234-A)
+- **#451** [pending] exec236 QUALITY TAIL: 18 deep-flag rows, 210-J ruling, 228-A pushfq, ceilings, CST_SLED
+- **#452** [completed] exec238: the last eleven deep-flag rows + 228-A pushfq, then the series close
+- **#453** [completed] exec240 THE CLOSE: re-measure deep-flags + scorers, golden re-bank, final CLEAN_SERIES_RESULT.md
+- **#454** [in_progress] exec241: Capstone out of the tree — census, python referee, deletions, proofs
+- **#455** [completed] exec241 cov_x86_64: reachable decode-row census + coverage close (stage 1)
+- **#456** [completed] exec241 refs_aarch64 (stage 2): aarch64 reference enforcement + 238-C fix
+- **#457** [completed] exec241 refs_riscv64 (stage 2): riscv64 reference enforcement
+- **#458** [completed] exec242/land T1: land the 12 orphaned commits on champsim-trace
+- **#459** [completed] exec242/land T2: prove -Dcst_capture=true compiles (blocker B4)
+- **#460** [completed] exec242/land T3: 1206 impossible memop attributions + devio exit gating (blocker B5)
+- **#461** [completed] exec242/land T4: static_reg_sets /tmp corpus + honest build docs
+- **#462** [completed] exec242 cov_a64: finish aarch64 reachable-instruction coverage
+- **#463** [pending] exec244/x86: the three remaining x86_64 wire defects + 243-C
+- **#464** [in_progress] exec245/rvmips: riscv 244-F (3 QEMU declaration gaps) + mipsel remainder
+- **#465** [pending] exec246/a64: last aarch64 wire residue — ld2/3/4 dst caps + gem5wp 114
+- **#466** [completed] exec247/cov: lift the 3 refusing coverage legs + finish mipsel attribution
+- **#467** [in_progress] exec247/x86: pin/x86_64 to its honest floor — cpuid loss + comparator rules
+- **#468** [in_progress] exec247/a64: FPSR helper-usage class + dc cvau merits + the capacity-comment derivation
+- **#469** [pending] exec248/a64: by-VA cache-maintenance access on the wire
+- **#470** [completed] exec257/verify: independent verification at c61da37051 (ARC-4 first defect wave)
+- **#471** [completed] exec258+259 PUSHED be8718307f..de38c465ca: wire-defect program + over-max oracle adopted (rows 504-512), golden re-banked, backup refreshed
+- **#472** [completed] exec260 PUSHED de38c465ca..da41785b06: over-max population declared (fans + lanes), 12 reds green, mutation 30/30, golden re-banked; rows 526/527 filed
+- **#473** [completed] exec261 PUSHED da41785b06..d1ee8406ae: row 514 upstream probe_access defect closed with NEVER-DELIVERED oracle; multi-limb mask contract (519/526/516/520); 515+503; rows 531-533 filed
+- **#474** [completed] exec262: row 501 promote-time labels + rows 495/496 close routes + row 533 audit + mops/smc diagnosis, then board + push verdict
+- **#475** [completed] exec262 board check (verify, never fix)
+- **#476** [completed] champsim-rebuild WAVE 1 COMPLETE: buckets 1/2/4 landed at 77f8cf3989, pushed
+- **#477** [completed] DONE: quality program applied — F4/F5 fixes + SAFE-NOW series LANDED+PUSHED at 7381914558
+- **#478** [completed] Phase-2 wave: softmmu WP net (x86_64) built+verified; netted fixes + pass-2 apply
+- **#479** [completed] Plugin increment 1 LANDED+PUSHED at ee25a8601f (spec carry 8114fb7020); budget 758 adjudicated
+- **#480** [in_progress] OVERNIGHT PROGRAM 2026-09-25 (maintainer grant: "proceed with the plan overnight... adjudicate... and proceed")
+- **#481** [completed] DONE: increment 4 LANDED+PUSHED (b86472a6cb..438fa7ec48) — register statement on the wire
+- **#482** [completed] DONE: inc5 attribution CLOSED — 16/16, three verified families; rebuild bound clean; mipsel seals conform
+- **#483** [completed] INCREMENT 6 COMPLETE+PUSHED (55aeb789c2): identity, system CP, markers, segments — all proven
+- **#484** [completed] STAGE 7a LANDED+PUSHED (55aeb789c2..4be01adc59): classification on the wire
+- **#485** [completed] STAGE 7b LANDED+PUSHED (4be01adc59..6c47c6d8b2): dependencies on the wire
+- **#486** [completed] STAGE 7c APPROVED + PUSHED (6c47c6d8b2..b6e14a894a); increment 7 ladder complete
+- **#487** [completed] CORRECTION WAVE LANDED+PUSHED (b6e14a894a..d289f9e8b2): all five refuted items closed from source
+- **#488** [completed] DATA-OPERAND WAVE LANDED+PUSHED (d289f9e8b2..f1264d2183): W7b-1/2 closed, 397→20 address-mask recovery, rr witness GREEN, fd witness adjudicated
+- **#489** [in_progress] System-mode WP wave (from f1264d2183): wrong-path on the rebuild plugin, softmmu, 4 ISAs
+- **#490** [pending] RATE FINDING (pre-existing at f1264d2183): user-mode sha1 wp d16 ~15 min vs inc5-era 44-66 s; d64 spill >30 GB/run
+- **#491** [completed] F7 CLOSED at 3f8b044eb7: wrong-path FRSTOR wrap took the slow path, not an abort — and it UNMASKED F9
+- **#492** [completed] F8 CLOSED (a53b5951c0 + 74caf8cb2e): mips timer-resync leak + WP-fed CP cutting — cpproj IDENTICAL at 895.7M entries
+- **#493** [pending] Carry into #489 ledger: riscv cbo.zero WP-drop finding (filed in passing)
+- **#494** [completed] F9 CLOSED at a4dcbb9bfc: excursion-scoped reclaim of spec-born objects — residual throughput blocker spun off as F10
+- **#495** [completed] F10 CLOSED (ff83bb8f5c + 06a4f6da41): budget-edge cut — rate bar met (~3,510s run, ≥752K insns/s); close bad_alloc spun off as F12
+- **#496** [completed] F11 DONE (no commit, correct STOP): statement-aware oracle LANDED + leak PROVEN on 3 cells; 41 rows refuted as the mechanism — fix re-briefed as F13
+- **#497** [pending] icount I/O-replay memops land on the wrong instruction (all ISAs, both arms) — attribution depends on QEMU TB layout
+- **#498** [pending] Cross-process block-end marks: insn identity (pc,bytes,sys) shares cutting evidence across address spaces
+- **#499** [completed] CLOSED tool-side by F15 (2e6e7651b9): decoder body no longer scales with trace length; residual floor is the writer-side dictionary
+- **#500** [completed] F12 CLOSED (d384aabd6c plugin + f81dd62ad8 tools): the x86 cell PUBLISHES, close bounded — two residual reds spun off as F14/F15
+- **#501** [pending] Spec-TB length past the budget: cut excursions translate 250-512 insns to use 16 (~53% of post-cut x86 wp16 wall)
+- **#502** [pending] WP-only retranslation variance: 12 mips identities state a source on first translation, nothing later (delay-slot hflag hypothesis)
+- **#503** [pending] F13 commits REMOVED by maintainer (reset to 74caf8cb2e, 2026-10-15) — statement-leak fix returns only via the parity audit
+- **#504** [completed] F14 CLOSED (097da13ee7, engine-only): reserve_exhausted=0 by construction — determinism carrier refuted, re-attributed to icount slice coupling (→#507)
+- **#505** [completed] F15 CLOSED (2e6e7651b9 on champsim-trace): first complete decode of the x86 wp16 trace — 9.28GB under the cap, every identity proof green
+- **#506** [completed] LANDED in F17 (9b55be35aa): unfetchable spec ifetch fetches nothing — fabricated mass gone, dictionary 4.10M/385.5MB → 611K/77.5MB
+- **#507** [completed] OWN-QUANTUM FIX DEFECTIVE AS IMPLEMENTED (F18 hand-back, audit §8d): ade04795e1 achieves r1/r2 byte-identity on the boot cell BUT leaks WP into GUEST TIME — console diverges from line 306; D4 violated; HELD from merge/push. Original's -icount coupling stays adjudicated a bug (R-1016-C). All system readings so far are the WINDOWLESS cell (diagnostic only)
+- **#508** [pending] LATENT CP determinism hazard: entry counts depend on tb_flush placement, and flush placement depends on non-reproducible host code size
+- **#509** [completed] RESOLVED BY RULING A (2026-10-16): windowless system tracing is invalid — stale-seed class has no subject inside the contract; rebuild must refuse like the original
+- **#510** [pending] F19: restore the original's windowless-system-mode refusal + re-point the matrix at windowed cells + minting-mode parity check
+- **#511** [completed] CLOSED: T7-200..241 classified from source under R-1016-D (41 NOT-APPLICABLE, 1 ABSENT port-owed: simpoint_sweep.sh); 3 ambiguous rows named; inventory UNKNOWN 50→13
+- **#512** [pending] REG_IP corrected series on f7 (task #512): in-order delay-slot emission + P3-P7 classes
+- **#513** [pending] Attribute the windowed-cell CP-depends-on-WP divergence (174,780 records / 210 CP keys, dl=1 vs 5)
+- **#514** [pending] Restore imm= memory-displacement statements on f7 (original states them, rebuild does not)

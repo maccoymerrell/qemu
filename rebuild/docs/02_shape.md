@@ -329,9 +329,11 @@ should own.
 
 Each need below is derived from a capture stage; the base must meet it. The
 golden's existing base modifications are the **evidence** each is achievable and
-the **anti-drop ledger** — enumerated in detail in `02a_qemu_interface.md`, which
-this section governs (02a is re-headed to map each modification under the need it
-serves, not to organise the layer). **None of this surface is dropped;** the one
+the **anti-drop ledger** — enumerated in detail in `02a_qemu_interface.md`. This
+section governs that tab, and 02a is **owed the same re-heading** it has not yet
+received: each modification mapped under the capture need it serves here, not
+organised as a golden inventory. That debt is the immediate next step; Layer 3
+inherits it if it is not closed first. **None of this surface is dropped;** the one
 *addition* is H.2.
 
 1. **Decode facts, at translation** (for B.1): per-instruction src/dst sets,

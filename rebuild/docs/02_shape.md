@@ -1,374 +1,388 @@
 # ChampSim Tracer — Layer 2: the SHAPE
 
-*Layer 2 of 3. This layer does two jobs at once, and the second is the hard one:*
+*The shape is derived from what a real machine does (REALITY) and what the
+tracer must record about it (INTENT, Layer 1). It is **not** a description of the
+golden plugin's modules. Every mechanism below exists because reality and intent
+require it; the golden tracer is consulted only to verify such a mechanism is
+achievable and to judge — by one test, **does it record what actually happened,
+correctly** — whether the golden's way is kept or changed. Each claim carries its
+receipt: `[§n]` = Layer 1 INTENT section; `[fmt]`/`[arch]`/`[qm]` = the
+authoritative docs; `[git:sha]` = a golden commit; `[real]` = a fact about the
+hardware being modelled.*
 
-1. **Describe the shape faithfully** — every mechanism and data structure the
-   tracer needs, the data flow CP and WP, what it reads from QEMU and where and
-   when (the QEMU boundary is its own tab, `02a_qemu_interface.md`).
-2. **Reduce the shape to its bare form** — each mechanism gets a **keep / change /
-   rework** verdict, with discernment about whether the current shape is the best
-   for its task. A verdict is grounded in the reality design (Layer 1), the wire
-   contract (`format.rst`), and the golden code as it actually stands — read in
-   planning, never copied into the rebuild. By the end, the tapestry is set and
-   each block is ready for Layer 3's per-function detail.
-
-Receipts: `[arch]` = `architecture.rst`; `[fmt §…]` = `format.rst`; `[qm]` =
-`qemu_modifications.rst` / tab 02a; `[hdr:f]` = a plugin header; `[intent §…]` =
-Layer 1; `[git:sha]` = a golden commit; `[rule]` = a standing ruling. The golden
-is a flawed reference: where a mechanism's current shape is a golden bug, the
-verdict says so and §8 carries the cross-reference.
-
-The **simplification thesis**, stated once up front because it governs half the
-verdicts: **separate the capture model from the serialization.** The information
-the trace must carry (Layer 1 §2–§3.6) is one thing; how bytes are written is
-another, and today they are fused in a 4,853-line hand-rolled delta-encoder with
-its own overlays, FID numbering, and two-pass decoder recipe. The bare form is a
-**capture core** that produces a typed record model and a **pluggable
-serialization backend** behind a seam — with a database/columnar backend
-(tester point e) assessed as the primary, because it makes tester points a, b and
-c free and deletes most of the encoder. §6 is where that lands.
+By the end, every mechanism and data structure the tracer needs is introduced and
+judged, ready for Layer 3 to specify the functions inside each block.
 
 ---
 
-## 1. The block diagram
+## 0. What is being modelled, and what must be produced
+
+**REALITY.** A real core fetches an instruction, decodes it, executes it —
+reading and writing registers and memory at computed addresses, with per-lane
+structure for vector operations — and at a branch resolves a direction and a
+target. A real out-of-order frontend also fetches *speculatively* down the path a
+misprediction would take, bounded, and squashes it at retire with no
+architectural effect. All of this happens as software threads inside address
+spaces at privilege levels, taking synchronous faults and asynchronous
+interrupts. `[real][§1]`
+
+**INTENT.** Record, per executed instruction, exactly the facts a
+microarchitectural simulator needs to model that core: opcode, registers,
+memops, register data, memory data, memory addresses, intra-instruction
+dependencies, vector lanes, memop→lane maps — in commit order, on the correct
+path **and** the wrong-path shadow, across the four ISAs, every reachable
+instruction classified, scoped in system mode by `(thread, asid, privilege)`.
+`[§0]`
+
+The tracer is therefore **a faithful recorder of that processing**, and its shape
+is the shape of the processing, not of the emulator that hosts it. QEMU is the
+instrument the recorder reads through (§H); it is never the backbone.
 
 ```
-                         ┌──────────────────────────── QEMU base (tab 02a) ───────────────────────────┐
-                         │ decode facts · branch target+dir · per-access provenance · path-event queue │
-                         │ spec-mode session · containment · vclock freeze · get_plugin_state · thread  │
-                         └───────────────▲───────────────────────────────────▲──────────────────────────┘
-                                         │ translation-time                   │ execute-time
-   ┌─────────────────────────────────────────────────┐        ┌───────────────────────────────────────────┐
-   │ TRANSLATE  (vcpu_tb_trans, once per TB)          │        │ EXECUTE  (vcpu_tb_exec, once per TB exec)   │
-   │  · poison/byte-stability gate                    │        │  shared prologue: WP early-out · promote ·  │
-   │  · fragment splitter  → tb_templates_ (CODE/SPEC)│        │    capture-mute latch · vclock freeze       │
-   │  · qdep seating (QEMU dataflow) + vocabulary join│        │  ┌── PathBuilder step (per vCPU thread) ──┐ │
-   │  · lane / synthetic-EA / branch-target statements│───────▶│  │ step_events: async-mute, foreign-ASID, │ │
-   └─────────────────────────────────────────────────┘        │  │   pending-seal SWAP (the deferral)      │ │
-                                                               │  │ tw_manage_window (segment open/close)   │ │
-   capture sinks (per vCPU thread, TLS):                       │  │ step_seal: fault frames, SEAL WALK ─────┼─┐
-     mem_access_recorder · reg_snap_collector ◀────────────────┤  └─────────────────────────────────────────┘ │
-                                                               └───────────────────────────────────────────┘ │
-                                         chain assembler (fragments → true BB) ◀──────────────────────────────┘
-                                         bb_map_ (true-BB dictionary) ◀── commit
-                                                    │
-                            emit_finalized_bb ──────┼────────▶ WP simulator (synchronous nested exec_tb loop)
-                                                    │              spec session · WPBBEntry chain · termination
-                                                    ▼
-                            BodyEntry  ──▶  OUTPUT (field-delta overlays, FID encoder)  ──▶ writer thread ──▶ .cst
-                                                    ▲
-                            templates section + profile block + encoding maps (header)
+   A. SELECT       which execution to record                     (window/segment/marker)
+         |
+   B. OBSERVE      one instruction's reality, AT the instruction:
+         |            classify it (from QEMU's own decode) and capture its dynamic
+         |            facts — memops (addr/size/data), lanes, destination values,
+         |            resolved branch edge — in commit order, with no deferral
+         v
+   C. ASSEMBLE     the per-instruction stream into TRUE basic blocks
+         v
+   D. REMEMBER     a deduplicated dictionary of true BBs (+ SMC revision identity,
+         |            + honest cut-short extent) and one record per dynamic invocation
+         v
+   E. CONTROL FLOW the resolved branch edge, and the bounded, time-transparent
+         |            wrong-path shadow; bulk/iterating ops recorded per access
+         v
+   F. SCOPE        tag every record (thread, asid, privilege); keep the workload's
+         |            synchronous kernel work in program order; exclude async noise  (system mode)
+         v
+   G. RECORD+WRITE a typed record model  ->  a pluggable serialization backend
+         v
+            consumed by the microarchitectural simulator
+
+   H. THE INSTRUMENT (QEMU): every arrow above is a fact the recorder needs from
+      QEMU, at a stated moment. §H derives those needs and what the base must
+      expose to meet them; the golden's base modifications are the evidence it is
+      achievable, and the anti-drop ledger, mapped under each need.
 ```
 
-Two flow loops `[arch]`: **CP** (correct path) in `vcpu_tb_exec` walks the
-*previous* TB's fragment list, attributes stats, folds into a true-BB chain, and
-emits a body record. **WP** (wrong path) is a synchronous nested loop kicked from
-`emit_finalized_bb` that enters spec mode, redirects the PC, and runs
-`cpu_plugin_exec_tb` to the `wpdepth` budget, then restores. Three locks:
-`exec_lock` (serialises the CP step incl. nested WP), `data_lock` (cache
-mutations inside that window), `unknown_warn_lock` (sidecar log). `[arch:
-Synchronization]`
-
-**Load-bearing invariant to reason from, not around:** *TBs are not basic
-blocks.* The fragment splitter partitions each QEMU TB at non-final branch
-terminators; the chain assembler folds fragments across TBs into true BBs sealed
-at the next branch. Always reason about true BBs. `[intent][arch: tb-vs-true-bb]`
+Everything that follows derives each stage from REALITY + INTENT, states the
+mechanism the tracer must have, then judges the golden's current approach.
 
 ---
 
-## 2. Translation path
+## A. SELECT — which execution is recorded
 
-| Mechanism / structure | What it is | Verdict |
-| --- | --- | --- |
-| **`vcpu_tb_trans`** | once-per-TB translation callback; runs poison/byte-stability gate, fragment splitter, qdep seating, vocabulary join, lane/EA/branch-target statements | **KEEP** — the amortised classification cost `[arch: Performance]` |
-| **Poison / byte-stability gate** | refuses a TB whose bytes don't decode (`qemu_plugin_insn_undecoded`) or changed since first sighting; CP heals, SPEC only reads; content-hashed, flush-persistent | **KEEP** — reality-forced (what the CPU refuses to execute, the tracer refuses to record) `[arch: poison-detection]` |
-| **Fragment splitter** (`split_tb_into_fragments`) + **`TbTerminus`** (COMPLETE / BARE_BRANCH / NONE) | partitions a TB at mid-TB branch terminators; the unit the chain assembler folds | **KEEP** — the sound replacement for per-TB BB reasoning `[arch: tb-vs-true-bb]` |
-| **`tb_templates_`** + **CODE/SPEC dedup indexes** (`tb_chain_dedup_`, `spec_chain_index_`) | per-translation fragment templates (one per fragment), class-split so SPEC reclaims at flush and CODE persists; keyed `(asid_root, start_pc, canonical-insn-count)` | **KEEP mechanism, ASSESS the dual-index split** — the CODE/SPEC partition is a perf/lifetime optimisation; Layer 3 confirms whether a single generation-tagged index with a reclaim predicate is simpler at equal cost `[hdr:bb_template_cache.h]` |
-| **qdep seating** (`champsim_tracer_qdep`) | reads per-instruction src/dst sets, per-access provenance and fold notes from QEMU's dataflow ABI; **consults no second decoder** | **KEEP** — the zero-Capstone spine; the single biggest correctness win of the current tree `[intent §3.1][02a §1]` |
-| **Vocabulary table** (`champsim_tracer_vocabulary`) | one sorted array joining a QEMU-stated generic word → `GenericOpcode`/`BranchType`; refuses a word this build cannot read | **KEEP** — one table, infers nothing from operands `[arch: subsystem-map]` |
+**REALITY/INTENT `[§3.7]`.** A researcher records a bounded region of a program,
+or a chosen process inside a whole system. In user mode the region is named by a
+clock position (simpoint — the defining case: N regions, each a **stand-alone**
+trace, in one pass — or icount or symbol). In system mode a clock cannot say
+*whose* instructions it counts, so the region is named by a **marker** the traced
+process runs, and a simpoint schedule is composed onto that marker.
 
----
+**Mechanism the tracer must have.** A selector that turns capture on over exactly
+the chosen span and off outside it; in system mode, a **content-at-vaddr gate**
+that admits precisely the contexts mapping the marker bytes — and *only* that, no
+root/asid/pid stored or compared as identity `[§3.6]`. Each simpoint region opens
+fresh and carries nothing from a prior region (byte-identical whether traced alone
+or as one of N). A system run must have a terminator (END marker, shutdown,
+dead-latch, stall ceiling) or be refused.
 
-## 3. Template store (the dictionary)
-
-The faithful shape is **seven maps** `[hdr:bb_template_cache.h]`: `tb_templates_`
-(+ two dedup indexes), `bb_map_` (true BBs, serialised), `alt_map_`
-(never-executed alternates, `static_templates=1`), `partial_bb_map_` (cut-short
-extents), `retired_revisions_` (SMC), `revision_by_sig_` (A/B/A reuse),
-`revision_slots_` (cap). Plus `SegRef` generation-stamping for cross-segment
-handles, and **two** `commit_true_bb` variants (array vs reference, the second a
-WP-hot-path copy-elision).
-
-- **`BBTemplate`** (static shape: PC seq, generic opcode, branch type, src/dst
-  reg IDs, immediate, raw bytes, dep block, lane masks, profile block) and
-  **`bb_map_`** (keyed `(asid_root, start_pc)`; kernel code → shared
-  `CST_KERNEL_ASID_ROOT` sentinel). **KEEP** — `template_id` identity, multi-ASID
-  keying and the kernel sentinel are all reality-forced `[intent §3.2][fmt §6]`.
-- **SMC revisions** (`resolve_true_bb` → mint a fresh `template_id`, retire the
-  old by content signature, A/B/A reuse, per-PC cap). **KEEP the contract**
-  (`[fmt §6][limits: SMC]`); **ASSESS the machinery** — three maps + two keys
-  (`RevKey`, `BBKey`) for one feature. Layer 3 asks whether the content-signature
-  index alone carries it.
-- **Cut-short extents** (`partial_bb_map_`, keyed by `(asid_root, start_pc,
-  n_insns, sig)`) exist because `bb_map_` is address-keyed and would hand back the
-  *longer* template for a shorter run — the over-claim. **KEEP** — this is the
-  honest-extent machinery that stops the close-time over-claim `[arch:
-  cp-flow][hdr]`.
-- **Alternates** (`alt_map_`, `static_templates=1`, off by default). **KEEP as
-  optional** — it is already a no-wire-flag, body-byte-identical add-on `[fmt
-  §… insn_flag; arch: static-templates]`.
-- **Tester point (b) — template initial FID slots + first values.** Today a
-  template declares its static shape and dep/lane masks but **not** the set of
-  field-IDs its body entries will populate nor their initial values; the decoder
-  learns slots as they first appear. The rebuild's template record gains a
-  **declared initial field-state** (the FIDs this block emits + their baseline
-  values) so a consumer pre-allocates per-block columns, and so a WP entry that
-  never had a CP visit bases its deltas off the template's values rather than
-  paying a first-observation cost (feeds tester c). **CHANGE** — a templates-
-  section addition; magic bump at formal release (allowed pre-release). Under the
-  DB backend (§6) it is the block's schema row and is free `[intent §3.2][fmt §6]`.
-
-**Verdict summary:** the store's *contracts* are reality-forced and kept; the
-*map count and the two commit variants* are the accreted-complexity the
-simplification eye lands on, and Layer 3 is tasked to collapse what the capture
-model does not actually require — most sharply once the serialization backend
-(§6) owns dedup/columnarisation that some of these maps hand-roll.
+**Judgment.** KEEP — the content-gate and marker windows are reality-forced
+(`[§3.6]`: root/ASID identity was tried and failed). The golden's
+segment/simpoint managers are an acceptable implementation of "a selector that
+yields the chosen execution, each region stand-alone"; Layer 3 judges their
+internals by that requirement, not by their current structure.
 
 ---
 
-## 4. CP flow, the PathBuilder, and the deferred structure (the headline rework)
+## B. OBSERVE one instruction — the core of the shape
 
-**Faithful shape** `[arch: cp-flow, path-builder][hdr:path_builder.h]`:
-`vcpu_tb_exec` fires once per executed TB. A shared prologue (WP early-out,
-promote-to-CODE, capture-mute latch, vclock freeze, icount read) precedes the
-PathBuilder step, split in two around window management because the gate order is
-load-bearing:
+**REALITY.** When an instruction executes, everything about it is knowable *at
+that instruction*: its identity, which registers it read and wrote and the values
+written, which memory it touched, at what addresses, with what data, feeding which
+vector lanes. A real machine does not need the *next* instruction to know what
+this one did. `[real]`
 
-- **`step_events`** (pre-window): async-mute window, foreign-ASID boundary, and
-  the **pending-seal swap** — the current TB is promoted into the pending-seal
-  slot and the previous occupant becomes the TB the seal phase walks.
-- **`step_seal`** (post-window): fault-entry classification against the deferred
-  prev, the shared **seal walk** (`collect_finalized_bbs`: fold fragments, resolve
-  the terminal branch, update branch history, resolve the WP target), and emission.
+**INTENT `[§0, §3.1, §3.3, §3.4]`.** Record that fact set, per instruction, in
+commit order.
 
-Supporting structures, all **reality-forced KEEP**: the per-vCPU **scoreboard**
-(inline stores of `current_pc` / `prev_start_pc` / `prev_fall_through` /
-`TbTerminus`, so the executed tail is always known), the **chain assembler**
-(fragments → true BB), the per-vCPU **fault ledger** (`CtxFrame` keyed `(thread,
-window, resume_pc)`, read per owning thread), and the **async exclusion** window.
-The fault-split program-order contract (executed prefix emitted *at* the fault,
-continuation after, each piece declaring its range) is a Layer-1 §3.6 requirement
-and is **KEEP**. `[arch: fault-excursions]`
+**Mechanisms the tracer must have:**
 
-### The deferred structure — why it exists and the rework
+1. **Classify from QEMU's behaviour, never a second decoder.** The generic
+   opcode, branch type, register in/out sets, intra-instruction dependency
+   structure, and lane structure are read from the target's own decode through
+   the dataflow ABI and joined against one small vocabulary table. What the
+   emulator refuses to execute is what the tracer refuses to record.
+   **KEEP** — this is the zero-Capstone spine and the single biggest correctness
+   property of the current tree `[§3.1][qm]`. (Capstone is the *offline referee's*
+   alone.)
 
-The **pending-seal slot defers TB *N* to the dispatch of TB *N+1*** because two
-facts are only knowable one dispatch late:
+2. **The lane-mask model.** Four dynamic per-slot masks (src / dst / load / store);
+   the opcode kind only says *where to read*; the actual mask is computed from the
+   operand/memop layout at execution. **KEEP** — required `[§3.4]`; a false lane
+   edge costs a consumer as much as a missing one.
 
-1. **the tail instruction's post-execution register snapshot** — a destination
-   value is read by the *next* instruction's callback; the TB's last instruction
-   has no in-TB successor, so its snapshot waits for the next TB
-   (`reg_snap_collector`'s `snap_prev_tail_dsts`); and
-2. **which fragment executed, and its last PC** — resolved from the successor's
-   inline `current_pc` store.
+3. **Capture the dynamic facts AT the instruction, in commit order** — the memop
+   addresses/sizes/data, the per-lane masks and memop→lane map, and the
+   destination-register values this instruction wrote. This is the load-bearing
+   reality point of the whole layer.
 
-That one-dispatch lag is the **root of a whole class of machinery and of the
-close-time fabrication bugs:**
+   **CHANGE — this is where the golden is wrong, and it is the example the
+   mandate named.** The golden cannot see a block's tail-instruction destination
+   values or its branch resolution until QEMU dispatches the *next* translation
+   block, so it carries a **deferred (pending-seal) structure**: it holds the
+   finished block for a dispatch, stamps a context label at promote, and emits
+   late. Judged against ACCURACY, that defer is a defect, not a design: at a
+   close the held block publishes a register value from the wrong moment
+   (`#79`) and a branch outcome that was never observed (`#81`), and it forces a
+   whole apparatus of transfer registers and label-stamping to paper over the
+   lateness `[arch][git:6494135e39]`. A real machine commits the instruction's
+   results at the instruction; the tracer must capture them there. So the shape
+   is **in-instruction capture with no pending-seal slot**, and the instrument is
+   made to deliver what that needs (§H.2: a QEMU post-retirement per-instruction
+   delivery of committed destination values + resolved edge). The branch *target*
+   (direct) and *resolved direction* already arrive in-instruction via existing
+   hooks `[git:59f8101261]`, so only the destination-value and
+   executed-fragment facts drive this change. Removing the defer dissolves the
+   label-stamping/ fault-depth-transfer machinery as a side effect — complexity
+   that existed only to serve the lateness.
 
-- It forces the **`CstEmitLabel`** transfer register — because every body entry is
-  emitted ≥1 dispatch after it ran, the `(thread, asid)` context label must be
-  **stamped at promote** and carried to emit, lest the departed block publish
-  under the incomer's label (ledger row 501). `[hdr:path_builder.h]`
-- It forces the **`g_emit_fault_depth`** transfer register and its twice-per-seal
-  re-stamp. `[arch: depth-pipeline]`
-- At a close the slot holds a block with no coming successor, so historically the
-  flush published the tail's register values from the wrong moment (**golden bug
-  #79**) and a branch outcome it never observed (**golden bug #81**); the current
-  tree papers these with `CST_BB_FLAG_BRANCH_UNRESOLVED` and the measured-extent
-  emit, but the *root* is the deferral. `[git: 6494135e39][fmt §5.6, §5.7]`
-
-**Already solved, do not re-open:** the branch *target* (direct) and resolved
-*direction* are captured in-instruction by `branch_target_pc` /
-`plugin_gen_record_branch_target` and the `59f8101261` hook — so the branch half
-of the deferral is gone; only the register snapshot and fragment-resolution
-remain. `[02a §1, §7]`
-
-**REWORK (the archetype the maintainer named):** a **QEMU post-retirement
-per-instruction delivery** (tab 02a §7) that hands the plugin an instruction's
-committed destination values, the fact it retired, and its own next-PC *at that
-instruction*. If the same signal also resolves which fragment executed, the
-pending-seal slot, the `CstEmitLabel` stamp-at-promote dance, the fault-depth
-re-stamp, and the close-time fabrication class all dissolve — the block is sealed
-and emitted where it ran. Layer 3's first duty here is to answer, against the
-code, **whether the signal removes the slot entirely or only the register half**;
-the shape is designed to the "removes it entirely" target and falls back only if
-the fragment-resolution cannot ride the same interface.
+4. **Synthetic effective address for memory ops QEMU lowers to no memop** —
+   software prefetch, cache-line ops, TLB shootdowns, `DC ZVA`, `CBO.ZERO`.
+   REALITY: these address memory and a cache/prefetcher model must see the line;
+   INTENT: surface the address `[§3.3]`. Mechanism: state the EA at the decode
+   site, compute `base + index·scale + disp` at execution. **KEEP** `[qm]`.
 
 ---
 
-## 5. Capture sinks and the WP simulator
+## C. ASSEMBLE into true basic blocks
 
-- **`mem_access_recorder`** — the `vcpu_mem_cb` sink, per-thread TLS vector (CP)
-  and `g_wp_state.mem_accesses` (WP); caps at `CST_FID_SLOT_COUNT`=512 per
-  direction. **KEEP** `[arch: subsystem-map][fmt §5.2]`.
-- **`reg_snap_collector`** — destination-register post-exec values, read via the
-  successor instruction's callback (the one-insn-late read) with a live
-  post-fragment fallback for the WP trailing insn. **CHANGE with the rework (§4)**
-  — the post-retirement interface replaces the one-insn-late read and the
-  fallback with one in-instruction delivery `[arch: subsystem-map][02a §7]`.
-- **Synthetic-EA** — prefetch/cache/TLB/`DC ZVA`/`CBO.ZERO` carry a stated EA
-  computed from base/index at exec. **KEEP** `[fmt §5.2][02a §1]`.
-- **WP simulator** (`champsim_tracer_wp.cc`) — synchronous nested loop: save
-  state, `spec_mode_begin`, redirect PC, `cpu_plugin_exec_tb` to budget, restore.
-  Emits a **`WPBBEntry`** chain moved into the owning `BodyEntry`. Termination
-  conditions (budget / synthetic-data fault / syscall-class / translation-unavail
-  / containment bail / flush-rerun) are a Layer-1 §3.5 contract. **KEEP**, on the
-  02a wrong-path interface `[arch: wp-flow, wp-termination][02a §2]`.
-- **Tester point (d) — REP/MOPS unrolled per iteration/access.** Both fan out to
-  1-insn self-loop entries (REP per iteration counted from the count register;
-  MOPS per memory access, bytes anchored). The *mechanism exists* and the golden
-  fixes landed (`[git: 30e2246c0e, e1c3e4a238, 6217ac7b98, 5a6cb09d0a]`). **KEEP
-  the contract**; Layer 3 states the correct unrolling (per-iteration register
-  writes, one access per MOPS entry, WP single-steps REP and `wp_fan_self_loop`
-  splits MOPS) and §8 flags the golden-bug history so validation is not confused
-  `[arch: self-loop][qm — rep accounting; bulk-memory][intent §3.3]`.
+**REALITY/consumer `[§3.2]`.** Fetch and the dictionary work at basic-block
+granularity: the run of instructions from a branch target up to and including the
+next branch. That is the unit a simulator replays and the unit the dictionary
+dedups.
+
+**Mechanism the tracer must have.** Fold the per-instruction stream into **true
+basic blocks**. This is a genuine obligation, not a golden artifact, because the
+instrument does not hand them over ready-made: QEMU's translation block is not a
+basic block — it can split one BB across a page boundary and can hold several BBs
+when it keeps translating past a mid-block branch (e.g. a MIPS conditional trap).
+So the recorder must reconcile the instrument's TB stream to true BBs, sealing a
+block at its real terminator wherever the TB boundaries fall. **KEEP the
+requirement** `[arch]`; the golden's fragment-splitter + chain-assembler are one
+implementation of it, kept only insofar as they produce exactly the true BBs
+reality has — Layer 3 specifies them against that test.
 
 ---
 
-## 6. Output and serialization — the seam, and tester a/b/c/e
+## D. REMEMBER — the dictionary and the per-invocation record
 
-**Faithful shape** `[fmt §1–§6]`: a POSIX ustar archive of two members
-(`body.cst[.codec]`, `header.cst[.codec]`), optionally piped through
-xz/zstd/gz. The body is a field-delta stream: per-`(template_id, ins_pos,
-field_id)` persistent overlays (separate CP and WP, WP resolving WP→CP→default),
-a running section-local `ipos` cursor, `SLEB_WIDE` scalar deltas, an 8192-entry
-`field_id`→slot LUT, interleaved-by-slot FID numbering, and a two-pass decode
-(apply deltas, then materialise against the executed range). The header carries
-the encoding maps (names, not fixed numbers) and the templates + profile section.
+**REALITY/INTENT `[§3.2]`.** A static block runs many times; its static shape is
+fixed, its dynamic facts vary per run; self-modifying code genuinely replaces a
+block's instructions. A microarchitecture needs the static shape once and the
+dynamic facts every time.
 
-This is **~4,853 lines of hand-rolled encoder** whose entire job is to optimise
-size and read-efficiency ourselves. **The bare-form reduction is the seam:**
+**Mechanisms the tracer must have — stated as requirements:**
 
-- **A capture-core record model** — templates, body entries (range, memops,
-  reg-snaps, branch outcome), WP chains, context switches, profile — expressed as
-  typed records, independent of how they are written.
-- **A serialization backend behind that seam.** The current `.cst` delta-encoder
-  becomes **one** backend (the reference/fallback). **Tester point (e): assess a
-  database/open-format backend as the primary** so size and read-efficiency are a
-  maintained library's job, not ours. Candidates, to be measured not asserted:
-  - **SQLite** — streaming writes during a long run, ubiquitous, random-access +
-    indexed; row-oriented so larger on disk, and WP laziness is a query not a
-    layout.
-  - **Parquet / Arrow (columnar)** — per-column compression and predicate
-    pushdown give **lazy WP for free** (don't read the WP column group) and
-    **low-FID-equivalence for free** (columns are typed, no ULEB FID width); but
-    batch/row-group flush oriented, so the streaming-write ergonomics need care.
-  - The experiment: one capture-core, two backends, measured on size / encode
-    rate / decode RSS / consumer ergonomics (the ChampSim consumer reads via the
-    tools today) against the custom `.cst`.
-- **Tester point (a) — branch direction/target to low FIDs.** In the custom
-  backend these two ride nearly every branch block yet sit in the 2-byte FID
-  range; the rebuild assigns them `<128` (1-byte ULEB), the same ordering
-  discipline the layout-intent already permits `[fmt §5.1]`. Under a columnar
-  backend the concern **dissolves** (dedicated columns). **CHANGE** (custom
-  backend) / **free** (DB backend).
-- **Tester point (c) — WP as a lazy delta layer.** The WP→CP→default overlay
-  resolution is already the golden design `[fmt §5]`, but WP rides **inline** in
-  each body record, so a CP-only consumer still parses to skip it. The rebuild
-  makes WP a **separately-decodable layer** (its own section/stream or column
-  group) applied lazily on top of the CP overlay, its base-state overhead kept
-  low by the template initial values (b). **CHANGE** (custom backend: hoist WP to
-  its own section) / **free** (DB backend: separate table/column group).
-- **Encoder internals** (BitWriter, `RawBuf`, the FID→slot LUT, the per-thread
-  `FieldStateTable` overlays, the reg-handle/TLS caches). These are profiled
-  micro-optimisations of the hand-rolled path `[arch: Hot-path
-  micro-optimisations]`. **CHANGE/DELETE with the backend** — most do not survive
-  a library-backed serialization; keep only what the capture core itself needs.
-- **Writer thread** (bounded SPSC queue, one per segment) exists to keep a
-  compressor stall off the guest clock. **KEEP** — a backend that blocks on I/O
-  still needs the producer decoupled from the sink `[arch: async-writer]`.
+- **A deduplicated true-BB dictionary.** One static entry per distinct block
+  (PC sequence, generic opcode, branch type, src/dst register IDs, immediate, raw
+  bytes, dependency block, lane masks, and a pure-annotation profile a consumer
+  may discard). A block's identity is its **template id, not its address**,
+  because one address can be several blocks (SMC; and, in system mode, the same VA
+  in different address spaces is different code). **KEEP** — reality-forced `[fmt]`.
+- **SMC revision identity.** When the correct path re-executes a block whose bytes
+  changed, that is a *new block* — a fresh template, the old one retained for the
+  records that named it, and a returning prior state reused by content signature
+  so A/B/A patching is two blocks, not an unbounded chain. **KEEP the contract**
+  (`[§3.2][fmt]`) — reality: code mutates, and each executed state must be recorded
+  as what it was.
+- **Honest cut-short extent.** A block entered but not finished (a close, a
+  control-flow discontinuity) is recorded at the extent that **ran** — never
+  claimed whole, never discarded. **KEEP** — ACCURACY: the trace states what
+  executed and no more.
+- **Tester (b): the dictionary entry declares the field slots it will populate and
+  their initial values**, so a consumer pre-allocates per-block storage and a
+  wrong-path entry that never had a correct-path visit bases its deltas off those
+  initial values cheaply. **CHANGE/ADD** — a record-model addition `[§3.2]`.
+- **Optional never-executed coverage** (`static_templates`): a dictionary-only
+  entry for the untaken side of a branch, for a consumer reconstructing fetch
+  from the binary. **KEEP as optional**, body-byte-identical when off.
 
-**What the seam must preserve regardless of backend** (the capture contract, not
-the encoding): byte-identical output for a region whether traced alone or as one
-of N simpoints `[intent §3.7]`; the wire never fabricates an unobserved value
-(unresolved branch declared, never guessed) `[fmt §5.6]`; no information loss
-`[rule R12.1]`.
+**Judgment on complexity.** The golden implements these four requirements with
+seven maps plus two `commit` variants and generation-stamped cross-references
+`[arch]`. That is the implementation, not the shape. The requirements above are
+what reality demands; the map count is a Layer-3 simplicity question — **change
+candidate**: collapse whatever the record model and the serialization backend
+(§G) subsume (e.g. the backend can own dedup/columnarisation the maps hand-roll),
+keeping only the identity/SMC/cut-short semantics reality forces.
 
 ---
 
-## 7. Identity, windows, tools (faithful, mostly KEEP)
+## E. CONTROL FLOW — the branch edge and the wrong-path shadow
 
-- **Content-gate bit** (per vCPU, event-driven at every committed address-space
-  change; marker bytes re-read at each latched vaddr; no root/ASID/pid stored as
-  identity), **marker window**, **asid label index**, **`thread_id`** (guest
-  thread, never vCPU), **privilege / SYSTEM bit**, **kernel-strand identity**. All
-  **KEEP** — Layer-1 §3.6 reality-forced, on the 02a §4 interface.
-- **Segment manager** + **simpoint manager** + the window modes (user:
-  simpoint/icount/symbol/marker; system: marker-required, simpoint composed onto
-  it). **KEEP** — §3.7 user-interaction contract; simpoint = N stand-alone traces
-  in one pass `[intent §3.7][quickstart]`.
-- **Stats / profile block / histogram buckets**. **KEEP** — profile is pure PGO
-  annotation a consumer may drop `[fmt §6 profile]`.
-- **Offline tools** (`cst_decode`, `cst_audit`, `cst_visualize`), the **external
-  referee** (`cst_referee.py`, Capstone/LLVM, offline only), the **validator**.
-  **KEEP, and re-home onto the serialization seam** — a tool reads the capture
-  model through the backend, so a DB backend makes `cst_decode`/`cst_audit`
-  thinner (the library does the parsing) `[intent §3.11][index]`.
+**REALITY `[real][§3.5]`.** A branch resolves a direction and a target; that is a
+fetch fact of the instruction itself, not an inference from what runs next (and
+for a coincident-edge branch — taken target equals fall-through — only the
+resolved direction distinguishes the two). A real OoO frontend fetches down the
+mispredicted direction, bounded, through syscalls/traps (it fetches around one and
+squashes it), and the excursion has **zero architectural effect** — no guest time,
+no memory, no device state.
 
----
+**Mechanisms the tracer must have:**
 
-## 8. Golden bugs & corrections baked in here
-
-Stated at the mechanism they touch so validation is not confused later; each also
-rides the lessons doc's ledger with its in-golden status:
-
-- **REP/MOPS unrolling** (§5) — correct behaviour is per-iteration/per-access
-  self-loop entries with per-iteration register writes; golden fixes landed
-  (`30e2246c0e`, `e1c3e4a238`, `6217ac7b98`, `5a6cb09d0a`). The lessons doc
-  verifies each is in golden, not only in the rebuild.
-- **Branch direction/target criteria** (§4) — resolved runtime direction for
-  coincident-edge branches (`59f8101261`/`572102ab1b`); MIPS BLEZ/BGTZ are
-  conditional branches not calls (`adc7e2537a`); a CF_PARALLEL atomic's result is
-  the loaded value alone (`646940f50f`).
-- **Close-time fabrication** (§4) — stale tail register values (#79) and
-  fabricated unresolved branch (#81); the deferred-structure rework removes the
-  root, not just the symptom.
-- **QEMU-side corrections** (tab 02a §8) — PAN debug-read, x86 lazy-flags,
-  user-mode `probe_access`, device-timer re-arm, RISC-V itrigger, interrupt
-  replay. Carried, not re-derived.
+- **Record the resolved edge at the branch** — direction and target as the
+  instruction's own fact. **KEEP** (the golden landed this as a correctness fix
+  `[git:59f8101261,572102ab1b]`; coincident-edge and MIPS BLEZ/BGTZ `[git:adc7e2537a]`
+  are stated correctly). Never publish an edge that was not observed — an
+  unresolved terminator is declared unresolved, never guessed `[§4.7][fmt]`.
+- **Tester (a): the branch direction/target are emitted on nearly every block, so
+  they must be the cheapest fields** (low field-IDs under the custom encoding;
+  dedicated columns under a database backend — §G makes this free). **CHANGE**
+  (hot-field placement) `[§3.5]`.
+- **The wrong-path shadow** — a single execution-resolved mispredicted direction,
+  bounded by `wpdepth`, walking through a speculatively-fetched syscall/trap at its
+  fall-through, stopping only for a real fetch reason (budget exhausted, or an
+  instruction fetch the guest MMU cannot translate), never a host-instrument
+  limit, and consuming **zero guest time**. **KEEP** — reality-forced `[§3.5,§3.8]`;
+  needs a contained speculative mode + time-freeze from the instrument (§H.4).
+- **Bulk / iterating memory ops recorded per access (tester d).** REALITY: an x86
+  `REP` and an AArch64 FEAT_MOPS copy/set move memory iteration-by-iteration /
+  access-by-access; a real machine issues each access. So the recorder **unrolls**
+  each iteration (REP) / access (MOPS) as its own one-instruction self-loop
+  record, with per-iteration register writes. **KEEP the behaviour** (the
+  mechanism exists and its golden defects were fixed:
+  `[git:30e2246c0e,e1c3e4a238,6217ac7b98,5a6cb09d0a]`). **Clarified here for
+  validation:** the correct behaviour is one record per iteration/access with
+  per-iteration register writes and one access per MOPS record; the golden's
+  earlier failures to unroll these properly are *bugs fixed in golden*, and
+  validation must expect the correct, unrolled behaviour — not the old shape.
 
 ---
 
-## 9. The bare-form picture (what Layer 3 builds against)
+## F. SCOPE — identity in system mode
 
-The simplified module set, after the verdicts above:
+**REALITY `[§3.6]`.** The machine runs many threads in many address spaces at
+different privileges. The traced process's syscalls and fault handlers are real,
+workload-induced execution; asynchronous interrupts (timers, device IRQs) are
+unrelated OS noise.
 
-1. **Translate** — poison gate, fragment splitter, qdep seating, vocabulary join,
-   in-instruction statements (branch target/dir, lane, synthetic-EA). *(kept)*
-2. **Template store** — fewer maps than seven: the capture model needs a
-   true-BB dictionary with SMC revisions, cut-short extents, and optional
-   alternates; Layer 3 collapses the dedup/variant machinery the serialization
-   backend now subsumes. *(kept contract, reduced machinery)*
-3. **CP step** — **without the pending-seal deferral**: the post-retirement
-   interface (02a §7) seals and emits a block where it ran, dissolving the
-   `CstEmitLabel`/fault-depth transfer registers and the close-time fabrication
-   class. *(reworked)*
-4. **Capture sinks** — memops, in-instruction reg-snaps (reworked), synthetic-EA.
-5. **WP** — the synchronous excursion on the 02a §2 interface, per-iteration
-   REP/MOPS. *(kept)*
-6. **Capture core → serialization seam** — a typed record model, a pluggable
-   backend, a **database/columnar backend assessed as primary** (tester e), which
-   makes branch-FID ordering (a), template initial values (b) and lazy WP (c)
-   native rather than hand-rolled. *(reworked — the biggest deletion)*
-7. **Identity / windows / tools** — kept, re-homed onto the seam.
+**Mechanisms the tracer must have:**
 
-**Open assessments Layer 3 must close against the code** (flagged, not pre-decided):
-(i) does the post-retirement signal remove the pending-seal slot entirely or only
-the register half (§4); (ii) which serialization backend wins the measured
-experiment (§6); (iii) how far the template-store map count collapses once the
-backend owns dedup/columnarisation (§3); (iv) whether the two containment paths
-(`CF_FORCE_SLOW` vs portable `TLB_FORCE_SLOW`) unify (02a §7).
+- **Every record tagged `(thread_id, asid, privilege)`**, where `thread_id` is a
+  guest-thread identity (never a vCPU index), `asid` is an address-space *label*
+  (never an identity to match across time), and a per-insn `SYSTEM` bit marks
+  kernel execution. **KEEP** — reality-forced `[§3.6][arch]`.
+- **Content-at-vaddr identity only** (Stage A's gate) — no page-table root/ASID/pid
+  as identity. **KEEP** (`[§3.6]`: tried and failed otherwise).
+- **Synchronous kernel work kept, in program order:** a faulting block emits its
+  executed prefix *at the fault*, the handler at its nesting depth, the remainder
+  as a continuation of the same block after return — each piece declaring the
+  range it is complete for. **KEEP** — reality + ACCURACY `[§3.6][arch]`.
+- **Asynchronous interrupts excluded by default** (opt-in to trace). **KEEP** `[§3.6]`.
 
-Nothing in the QEMU interface (tab 02a) is dropped by any of this; the reworks
-**add** one interface (post-retirement delivery) and otherwise keep the hard-won
-data-path and wrong-path surface intact.
+**Judgment tie-back.** The golden carries a label-stamp-at-promote apparatus
+(`CstEmitLabel`) *because* it emits a dispatch late (Stage B). With in-instruction
+capture, a record is tagged with the context it executed in, directly — so the
+stamping apparatus is **changed out**, not reproduced. This is the same accuracy
+change as B.3, seen from the identity side.
+
+---
+
+## G. RECORD MODEL and SERIALIZATION — separable, by instruction
+
+**REALITY/INTENT `[§3.11]` + tester (e).** The *information* the trace carries and
+the *bytes* it is written as are two different concerns. The recorder's job is the
+information; writing it efficiently is a solved problem that a maintained library
+should own.
+
+**Mechanisms the tracer must have:**
+
+- **A typed record model** — templates, per-invocation records (range, memops,
+  register snapshots, resolved branch), wrong-path chains, context switches,
+  profile — expressed independently of how bytes are laid down. Its invariants are
+  reality's: **never serialise a value that was not observed; lose no information a
+  microarchitecture needs** `[§3.9, fmt]`.
+- **A pluggable serialization backend behind a seam (tester e).** The current
+  hand-rolled `.cst` delta encoder — per-`(template,ins_pos,field)` overlays, a
+  running FID cursor, an 8192-entry FID→slot LUT, a two-pass decoder — becomes
+  *one* backend, kept as a reference/fallback. The assessed **primary is a
+  database / columnar backend** (SQLite for streaming+indexed random access, or
+  Parquet/Arrow for per-column compression and predicate pushdown), so size and
+  read-efficiency are the library's job, not ours. **CHANGE** — this deletes most
+  of the 4,853-line encoder; judged by the simplicity test, in service of the same
+  correct record model.
+- **Tester (c): the wrong-path layer is a lazy delta on top of the correct-path
+  layer, separately decodable** — a consumer that does not model speculation never
+  pays to parse it. Native under a columnar backend (a separate column group);
+  under the custom backend it means hoisting WP out of the inline per-record
+  framing. **CHANGE** `[§3.5]`.
+- **Tester (a) resolves here too:** typed columns make the hot branch/ memop fields
+  cheap without any FID-width game.
+- **The async writer** (producer decoupled from the disk sink) stays under any
+  backend, because a sink that blocks must not deform guest timing. **KEEP** `[arch]`.
+
+---
+
+## H. THE INSTRUMENT — what QEMU must expose, and when (derived)
+
+Each need below is derived from a capture stage; the base must meet it. The
+golden's existing base modifications are the **evidence** each is achievable and
+the **anti-drop ledger** — enumerated in detail in `02a_qemu_interface.md`, which
+this section governs (02a is re-headed to map each modification under the need it
+serves, not to organise the layer). **None of this surface is dropped;** the one
+*addition* is H.2.
+
+1. **Decode facts, at translation** (for B.1): per-instruction src/dst sets,
+   per-access provenance, fold notes, the resolved static branch target, the
+   generic word — all from the target's own decode (`[qm]`: dataflow ABI,
+   `branch_target_pc`). KEEP.
+2. **Committed destination values + resolved direction + which fragment retired,
+   at/after the instruction** (for B.3) — **the one new interface**, a
+   post-retirement per-instruction delivery, so capture is in-instruction and the
+   pending-seal defer is gone. Derived from ACCURACY, not copied. (Direction
+   already delivered `[git:59f8101261]`; this adds the committed values and the
+   executed-fragment fact.)
+3. **Per-memop address/size/data at execution** (for B.3, B.4), incl. x86
+   lazy-flags resolved for plugin reads and PAN-exempt debug reads for the gate —
+   both golden correctness fixes `[qm]`. KEEP.
+4. **A contained speculative mode + guest-time freeze + resync** (for E): spec
+   mode begin/end, the spec store buffer + atomic shadow, `CF_FORCE_SLOW` /
+   `TLB_FORCE_SLOW` containment, no-speculation-without-paging, device/global
+   side-effect suppression, unsandboxable aborts, wrong-path syscalls
+   fetched-never-performed, MOPS spec clamp, the vclock freeze +
+   `spec_clock_resync` + vclock-agency, interrupt replay. KEEP — reality-forced
+   (a real wrong path has no architectural effect) `[qm]`.
+5. **Privilege / asid / thread-pointer / paging at execution** (for F), marker
+   never-split, path-event causality for faults/async, VA TB identity under
+   plugins, shutdown/reset close, disk-I/O ownership. KEEP `[qm]`.
+
+Open interface assessment, flagged not decided: whether `CF_FORCE_SLOW` (x86
+host) and the portable `TLB_FORCE_SLOW` unify behind one host-independent path.
+
+---
+
+## Ready for Layer 3
+
+Every mechanism the tracer needs is introduced above and judged. Layer 3 specifies
+the functions inside each block, and must close these derived-but-open points
+against the code (read only to verify, never to source the design):
+
+1. **B.3 / H.2** — the post-retirement delivery: does it remove the pending-seal
+   defer entirely (both the destination-value and the executed-fragment facts), or
+   only the register half; the shape is written to "entirely."
+2. **D** — how far the dictionary's seven-map machinery collapses once the record
+   model and the serialization backend own what reality does not force into
+   separate maps.
+3. **G** — which serialization backend wins a measured experiment (SQLite vs
+   Parquet/Arrow vs the custom `.cst` fallback), on size / encode rate / decode
+   cost / consumer ergonomics.
+4. **H.4** — whether the two containment paths unify.
+
+The judgments carry forward as this: **keep** = the golden records reality
+correctly there; **change** = it does not (B.3 accuracy, E/G tester points, F
+label apparatus) or carries complexity reality does not force (D maps, G encoder).
+Nothing here is organised by the golden's structure; it is organised by what a
+real machine does and what the intent records, which is the only thing this layer
+is allowed to be.
